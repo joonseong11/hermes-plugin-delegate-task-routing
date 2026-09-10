@@ -1,0 +1,21 @@
+name: delegate-task-routing
+version: 0.2.8
+description: "Strict per-turn orchestration policy, per-task routing, actual-route attribution, and deterministic Alex headers."
+author: handybus-agent-alex
+license: MIT
+homepage: https://github.com/handybus-agent-alex/hermes-delegate-task-routing
+tags:
+  - delegation
+  - routing
+  - policy
+kind: standalone
+portable: true
+capabilities:
+  - tools.override
+provides_tools:
+  - delegate_task
+  - route_turn
+provides_hooks:
+  - pre_llm_call
+  - pre_tool_call
+  - transform_llm_output

@@ -1,0 +1,23 @@
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Logs and generated artifacts
+*.log
+logs/
+artifacts/
+coverage.xml
+htmlcov/
+
+# Editor and OS files
+.DS_Store
+.vscode/
+.idea/
