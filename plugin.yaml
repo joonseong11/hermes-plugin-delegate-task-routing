@@ -3,7 +3,7 @@ version: 0.2.8
 description: "Strict per-turn orchestration policy, per-task routing, actual-route attribution, and deterministic Alex headers."
 author: handybus-agent-alex
 license: MIT
-homepage: https://github.com/handybus-agent-alex/hermes-delegate-task-routing
+homepage: https://github.com/joonseong11/hermes-plugin-delegate-task-routing
 tags:
   - delegation
   - routing

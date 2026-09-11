@@ -50,9 +50,44 @@ cannot be authenticated to the parent session, it is labeled `위임 기록 만�
 - Child results include requested values and locally observed child model, provider, effort, toolsets, and session ID. These fields are not remote-provider attestation.
 - Routed operation is supported for the active single-profile deployment. The plugin patches process-global private Python functions and is not validated for different allowlists across multiple profiles in one gateway process.
 
+
+## Settings and least privilege
+
+Configure explicit allowlists under the plugin entry; do not copy this example
+unchanged into production. Start with only models and toolsets that the parent
+agent already exposes. A requested toolset is rejected when it is not in this
+list, and when the parent exposes a concrete enabled-toolset list it must also
+be a subset of that parent list. Provider, endpoint, credential, ACP transport,
+and API-mode selection are never model-controlled.
+
+```yaml
+plugins:
+  entries:
+    delegate-task-routing:
+      settings:
+        allowed_models:
+          - gpt-5.6-terra-900k
+        allowed_reasoning_efforts: [low, medium, high]
+        allowed_toolsets: [file, web]
+```
+
+Settings are read when the plugin loads. Use your Hermes configuration command
+or reviewed configuration management, then restart or open a fresh CLI session
+before relying on a changed allowlist. A multi-profile deployment needs a
+separate gateway process per policy: this plugin patches process-global private
+Python functions and has not been validated with different profile allowlists
+in one process.
+
+`policy_bypass` is a protective degraded mode, not successful routing. If the
+routing tool cannot be safely pinned into the available tool surface, or its
+forced-call loop reaches its safety limit, the turn is marked `라우팅 정책 미적용`
+and logged rather than being repeatedly retried. Per-task validation still
+applies to any later delegation, but operators should investigate the Hermes
+compatibility/tool-surface change before treating that turn as policy-enforced.
+
 ## Update behavior
 
-The plugin lives under `/opt/data/plugins`, not the replaceable `/opt/hermes` image, so its files survive normal container/image replacement when `/opt/data` remains persistently mounted. Behavioral compatibility with a later Hermes version is not implied.
+Install the plugin in Hermes' persistent plugin directory, not the replaceable application image, so normal image replacement does not discard it. Behavioral compatibility with a later Hermes version is not implied.
 
 At load time it verifies selected native function names and signatures. If those structural checks fail, the plugin fails closed instead of guessing. Because routing also depends on Hermes constructing children synchronously before background dispatch, upgrades still require behavioral smoke tests. If a future Hermes release exposes all four field names (`label`, `model`, `reasoning_effort`, `toolsets`) natively, the plugin does not patch the built-in implementation; operators must separately verify that the native policy semantics match this plugin.
 
@@ -61,19 +96,12 @@ Allowlist settings and the extended schema are captured when the plugin loads. C
 ## Verification
 
 ```bash
-PYTHONPATH=/opt/hermes uv run --no-project --with pytest python -m pytest \
-  /opt/data/plugins/delegate-task-routing/tests/test_routing.py -q \
-  -k 'not installed_hermes_contract'
+HERMES_SRC=/path/to/hermes HERMES_PYTHON=/path/to/hermes-python \
+  ./scripts/verify.sh
 
-/opt/hermes/.venv/bin/python - <<'PY'
-import importlib.util
-p = '/opt/data/plugins/delegate-task-routing/__init__.py'
-s = importlib.util.spec_from_file_location('routing_contract', p)
-m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
-import tools.delegate_tool as live
-m._assert_compatible(live)
-print('installed contract: PASS')
-PY
+# The integration script performs the installed private-symbol contract probe.
+# It needs a local Hermes source tree and its matching Python environment.
+
 ```
 
 ## Disable / rollback
@@ -101,8 +129,8 @@ Deployment stages a complete replacement, retains a timestamped backup, and veri
 Rollback is also dry-run by default:
 
 ```bash
-./scripts/rollback.sh --from /opt/data/plugins/.delegate-task-routing.backup-TIMESTAMP
-./scripts/rollback.sh --from /opt/data/plugins/.delegate-task-routing.backup-TIMESTAMP --apply
+./scripts/rollback.sh --from $HERMES_HOME/plugins/.delegate-task-routing.backup-TIMESTAMP
+./scripts/rollback.sh --from $HERMES_HOME/plugins/.delegate-task-routing.backup-TIMESTAMP --apply
 ```
 
 Before a Hermes update:
@@ -113,16 +141,19 @@ Before a Hermes update:
 
 The generated report records the currently working Hermes/plugin pair. After the update, rerun verification and the Slack post-restart smoke test before declaring compatibility.
 
-## Release policy
+## Release and verification boundary
 
-- `main` must pass the pinned supported-Hermes CI job.
-- Latest Hermes `main` is tested as an experimental, non-blocking compatibility signal.
-- Release tags use `vMAJOR.MINOR.PATCH`.
-- Never bypass a failed private-symbol compatibility check.
-- A passing unit suite is not a substitute for the post-restart Slack test.
+The repository CI is a static-integrity check (Python compilation, manifest URL,
+and release-version consistency). It does **not** install Hermes or exercise its
+private symbols. `scripts/verify.sh` is the supported integration gate: it
+proves compilation, the complete automated policy suite, and compatibility with
+the locally installed Hermes delegation symbols.
+`scripts/pre-update-check.sh` additionally requires tested source and deployed
+plugin bytes to match. Release tags use `vMAJOR.MINOR.PATCH`; never bypass a
+failed private-symbol compatibility check.
 
-## Verification boundary
-
-`scripts/verify.sh` proves compilation, the complete automated policy suite, and compatibility with the installed Hermes delegation symbols. `scripts/pre-update-check.sh` additionally requires the tested source and deployed plugin bytes to match. CI repeats the suite against the pinned supported Hermes commit and treats current Hermes `main` as experimental.
-
-These automated checks do **not** prove a real provider request, gateway restart continuity, or Slack delivery. Those remain explicit release gates in [docs/SLACK_SMOKE_TEST.md](docs/SLACK_SMOKE_TEST.md); do not describe a release as fully operational until that checklist passes.
+Automated checks do **not** prove a real provider request, gateway restart
+continuity, or Slack delivery. Those remain explicit release gates in
+[docs/SLACK_SMOKE_TEST.md](docs/SLACK_SMOKE_TEST.md); do not describe a release
+as fully operational until that checklist passes. Local child metadata is an
+observation from the running process, not provider attestation.
