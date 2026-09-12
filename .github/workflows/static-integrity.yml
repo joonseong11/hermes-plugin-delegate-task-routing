@@ -1,0 +1,23 @@
+name: Static integrity
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  static-integrity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Compile repository Python
+        run: python -m py_compile __init__.py tests/test_routing.py
+      - name: Check release consistency and canonical homepage
+        run: |
+          ./scripts/check-version.sh
+          python -c "from pathlib import Path; assert 'homepage: https://github.com/joonseong11/hermes-plugin-delegate-task-routing' in Path('plugin.yaml').read_text()"
