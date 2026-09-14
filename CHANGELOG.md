@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.9] - 2026-09-14
+
+### Added
+
+- An authenticated, non-sensitive `delegation_lifecycle_for_turn` observer contract.
+- Worker/verifier completion-chain ownership so presentation plugins finalize only the delegations owned by the authenticated completion turn.
+- Durable one-time completion claims reject replayed envelopes, and retention prunes only consumed terminal records so live mandatory-verification chains cannot disappear.
+
 ## [0.2.8] - 2026-09-09
 
 ### Fixed

@@ -676,6 +676,15 @@ def test_worker_verifier_is_sequenced_across_async_completions(monkeypatch):
     verify_plan = plugin._TURN_PLANS[plugin._turn_key("parent", "verify-turn")]
     assert verify_plan["mode"] == "verification"
     assert verify_plan["expected_lanes"] == [verifier]
+    assert plugin.delegation_lifecycle_for_turn("parent", "verify-turn") == {
+        "mode": "verification", "delegation_ids": ["deleg-workers"], "dispatched": False,
+    }
+    plugin._pre_llm_policy(
+        session_id="parent", turn_id="replayed-worker", task_id="parent-task",
+        platform="slack", parent_session_id="",
+        user_message="[ASYNC DELEGATION BATCH COMPLETE — deleg-workers]",
+    )
+    assert plugin._TURN_PLANS[plugin._turn_key("parent", "replayed-worker")]["mode"] == "policy_error"
     forced = plugin._llm_request_policy(
         {"input": []},
         session_id="parent",
@@ -699,6 +708,46 @@ def test_worker_verifier_is_sequenced_across_async_completions(monkeypatch):
     final_plan = plugin._TURN_PLANS[plugin._turn_key("parent", "final-turn")]
     assert final_plan["mode"] == "completion"
     assert [x["label"] for x in final_plan["actual_routes"]] == ["구현", "기술검수"]
+    assert final_plan["owned_delegation_ids"] == ["deleg-workers", "deleg-verifiers"]
+    assert plugin.delegation_lifecycle_for_turn("parent", "final-turn") == {
+        "mode": "completion",
+        "delegation_ids": ["deleg-workers", "deleg-verifiers"],
+        "dispatched": True,
+    }
+    plugin._pre_llm_policy(
+        session_id="parent", turn_id="replayed-verifier", task_id="parent-task",
+        platform="slack", parent_session_id="",
+        user_message="[ASYNC DELEGATION BATCH COMPLETE — deleg-verifiers]",
+    )
+    assert plugin._TURN_PLANS[plugin._turn_key("parent", "replayed-verifier")]["mode"] == "policy_error"
+
+
+def test_lifecycle_contract_does_not_expose_route_payloads():
+    platform = type("PlatformValue", (), {"value": "slack"})()
+    assert plugin._is_enforced_parent(platform=platform, task_id="parent", parent_session_id="")
+    with plugin._POLICY_LOCK:
+        plugin._TURN_PLANS[plugin._turn_key("observer", "turn")] = {
+            "mode": "parallel", "delegation_id": "deleg-safe", "dispatched": True,
+            "reason": "secret reason", "lanes": [{"goal": "secret goal", "model": "secret model"}],
+        }
+    assert plugin.delegation_lifecycle_for_turn("observer", "turn") == {
+        "mode": "parallel", "delegation_ids": ["deleg-safe"], "dispatched": True,
+    }
+
+
+def test_retention_never_prunes_live_verification_chains():
+    plugin._PLUGIN_STATE = FakeState()
+    live = {
+        f"live-{index}": {"stage": "workers_dispatched", "parent_session_id": "parent", "created_at": index}
+        for index in range(101)
+    }
+    plugin._PLUGIN_STATE.set("delegations", live)
+    plugin._persist_delegation_policy(
+        "consumed", {"stage": "completion_consumed", "parent_session_id": "parent", "created_at": -1},
+    )
+    saved = dict(plugin._PLUGIN_STATE.get("delegations", {}) or {})
+    assert all(f"live-{index}" in saved for index in range(101))
+    assert "consumed" not in saved
 
 
 @pytest.mark.parametrize(

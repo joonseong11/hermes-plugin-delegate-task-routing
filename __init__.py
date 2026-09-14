@@ -25,7 +25,7 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-PLUGIN_VERSION = "0.2.8"
+PLUGIN_VERSION = "0.2.9"
 PLUGIN_ID = "delegate-task-routing"
 _PATCH_MARKER = "_delegate_task_routing_plugin_v1"
 _ROUTE_FIELDS = ("label", "model", "reasoning_effort", "toolsets")
@@ -621,6 +621,31 @@ def delegation_phase_for_turn(session_id: Any, turn_id: Any) -> str:
     return "worker"
 
 
+def delegation_lifecycle_for_turn(session_id: Any, turn_id: Any) -> dict[str, Any]:
+    """Return an authenticated, non-sensitive lifecycle view for observers.
+
+    The plan is created by this plugin only after route validation or durable
+    async-completion authentication.  Presentation plugins can therefore use
+    it without parsing user-controlled completion-marker text.  No goals,
+    labels, model names, toolsets, or result payloads are exposed.
+    """
+    with _POLICY_LOCK:
+        plan = _TURN_PLANS.get(_turn_key(session_id, turn_id))
+        if not isinstance(plan, Mapping):
+            return {"mode": "unrouted", "delegation_ids": []}
+        mode = str(plan.get("mode") or "unrouted")
+        ids: list[str] = []
+        for value in (
+            *(plan.get("owned_delegation_ids") or []),
+            plan.get("source_delegation_id"),
+            plan.get("delegation_id"),
+        ):
+            value = str(value or "").strip()
+            if value and value not in ids:
+                ids.append(value)
+        return {"mode": mode, "delegation_ids": ids, "dispatched": bool(plan.get("dispatched"))}
+
+
 def _resolve_turn_context(parent_agent: Any, kw: Mapping[str, Any]) -> tuple[str, str]:
     """Resolve (session_id, turn_id) for a tool-handler invocation.
 
@@ -645,7 +670,8 @@ def _resolve_turn_context(parent_agent: Any, kw: Mapping[str, Any]) -> tuple[str
 
 
 def _is_enforced_parent(*, platform: Any, task_id: Any, parent_session_id: Any = "") -> bool:
-    if str(platform or "").lower() not in _ENFORCED_PLATFORMS:
+    platform_value = getattr(platform, "value", platform)
+    if str(platform_value or "").lower() not in _ENFORCED_PLATFORMS:
         return False
     if str(task_id or "").startswith("sa-") or str(parent_session_id or ""):
         return False
@@ -847,16 +873,55 @@ def _persist_delegation_policy(delegation_id: str, record: Mapping[str, Any]) ->
         records = _durable_delegations()
         records[delegation_id] = dict(record)
         if len(records) > 100:
-            ordered = sorted(
-                records,
+            prunable = sorted(
+                (key for key, value in records.items()
+                 if str(value.get("stage") or "") in {"workers_consumed", "verifiers_consumed", "completion_consumed", "policy_error"}),
                 key=lambda key: float(records[key].get("created_at") or 0),
             )
-            for key in ordered[:-80]:
-                records.pop(key, None)
+            while len(records) > 80 and prunable:
+                records.pop(prunable.pop(0), None)
         _PLUGIN_STATE.set("delegations", records)
     except Exception as exc:
         _LOG.warning("Could not persist orchestration state %s: %s", delegation_id, exc)
         raise RuntimeError("could not persist mandatory verification state") from exc
+
+
+def _claim_completion_once(delegation_id: str, session_id: str, turn_id: str) -> dict[str, Any] | None:
+    """Atomically reserve one authenticated completion envelope per gateway process.
+
+    The durable stage makes replays fail closed across restarts. Active worker and
+    verifier chains remain non-prunable until their continuation is dispatched or
+    their final result is consumed.
+    """
+    with _POLICY_LOCK:
+        records = _durable_delegations()
+        current = records.get(delegation_id)
+        if isinstance(current, Mapping):
+            record = dict(current)
+            if not _owned_session(str(record.get("parent_session_id") or ""), session_id):
+                return None
+            stage = str(record.get("stage") or "")
+            if stage not in {"workers_dispatched", "verifiers_dispatched"}:
+                return None
+            claimed_stage = "workers_completion_claimed" if stage == "workers_dispatched" else "verifiers_completion_claimed"
+        else:
+            record = {"parent_session_id": session_id, "created_at": time.time()}
+            stage = "ordinary"
+            claimed_stage = "completion_consumed"
+        record.update(stage=claimed_stage, claimed_turn_id=turn_id, updated_at=time.time())
+        _persist_delegation_policy(delegation_id, record)
+        record["claimed_from_stage"] = stage
+        return record
+
+
+def _mark_completion_consumed(delegation_id: str, stage: str) -> None:
+    with _POLICY_LOCK:
+        record = _durable_delegations().get(delegation_id)
+        if not isinstance(record, Mapping):
+            return
+        updated = dict(record)
+        updated.update(stage=stage, updated_at=time.time())
+        _persist_delegation_policy(delegation_id, updated)
 
 
 def _compression_tip(con: sqlite3.Connection, session_id: str) -> str:
@@ -991,11 +1056,15 @@ def _mark_delegation_dispatch(plan: dict[str, Any], parsed: Mapping[str, Any]) -
                 {
                     "stage": "verifiers_dispatched",
                     "parent_session_id": plan.get("parent_session_id") or "",
+                    "source_delegation_id": plan.get("source_delegation_id") or "",
                     "lanes": plan.get("original_lanes") or plan.get("lanes") or [],
                     "prior_routes": plan.get("prior_routes") or [],
                     "created_at": time.time(),
                 },
             )
+            source_delegation_id = str(plan.get("source_delegation_id") or "").strip()
+            if source_delegation_id:
+                _mark_completion_consumed(source_delegation_id, "workers_consumed")
         except RuntimeError:
             plan["mode"] = "policy_error"
             plan["dispatched"] = False
@@ -1039,10 +1108,6 @@ def _pre_llm_policy(**kwargs: Any) -> Any:
         return None
     delegation_id = match.group(1).strip()
     actual = _verified_completion_routes(delegation_id, session_id)
-    record = _durable_delegations().get(delegation_id)
-    record_matches_session = isinstance(record, Mapping) and _owned_session(
-        str(record.get("parent_session_id") or ""), session_id
-    )
     if not actual:
         with _POLICY_LOCK:
             _TURN_PLANS[_turn_key(session_id, turn_id)] = {
@@ -1061,7 +1126,17 @@ def _pre_llm_policy(**kwargs: Any) -> Any:
                 "verifiers or claim completion."
             )
         }
-    if record_matches_session and record.get("stage") == "workers_dispatched":
+    record = _claim_completion_once(delegation_id, session_id, turn_id)
+    if record is None:
+        with _POLICY_LOCK:
+            _TURN_PLANS[_turn_key(session_id, turn_id)] = {
+                "mode": "policy_error", "reason": "async completion was already consumed",
+                "lanes": [], "actual_routes": [], "dispatched": False,
+                "delegation_id": delegation_id, "created_at": time.time(),
+            }
+        return {"context": "This authenticated async completion was already consumed. Do not dispatch or answer it again."}
+    claimed_from_stage = str(record.get("claimed_from_stage") or "")
+    if claimed_from_stage == "workers_dispatched":
         original_lanes = list(record.get("lanes") or [])
         verifiers = [lane for lane in original_lanes if lane.get("phase") == "verifier"]
         plan = {
@@ -1089,8 +1164,14 @@ def _pre_llm_policy(**kwargs: Any) -> Any:
                 "already recorded; call delegate_task directly."
             )
         }
-    if record_matches_session and record.get("stage") == "verifiers_dispatched":
+    if claimed_from_stage == "verifiers_dispatched":
         actual = list(record.get("prior_routes") or []) + actual
+    owned_delegation_ids = [delegation_id]
+    if claimed_from_stage == "verifiers_dispatched":
+        source_delegation_id = str(record.get("source_delegation_id") or "").strip()
+        if source_delegation_id and source_delegation_id not in owned_delegation_ids:
+            owned_delegation_ids.insert(0, source_delegation_id)
+        _mark_completion_consumed(delegation_id, "verifiers_consumed")
     with _POLICY_LOCK:
         _TURN_PLANS[_turn_key(session_id, turn_id)] = {
             "mode": "completion",
@@ -1099,6 +1180,7 @@ def _pre_llm_policy(**kwargs: Any) -> Any:
             "actual_routes": actual,
             "dispatched": True,
             "delegation_id": delegation_id,
+            "owned_delegation_ids": owned_delegation_ids,
             "created_at": time.time(),
         }
     if actual:

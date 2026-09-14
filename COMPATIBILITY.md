@@ -4,6 +4,7 @@ The plugin persists independently of the Hermes application image, but behaviora
 
 | Plugin version | Hermes version | Upstream commit | Python | Status | Evidence |
 |---|---|---|---|---|---|
+| 0.2.9 | 0.21.1 | `fef0e16f` | 3.13.5 | Supported locally | 48 tests + installed contract probe; authenticated non-sensitive lifecycle and worker/verifier completion-chain ownership |
 | 0.2.8 | 0.20.6 (2026.8.27) | `01740f352e2f2414b3bdb7791c2ed1f7bbb2b455` | 3.13.5 | Supported locally | 46 tests + installed contract probe; terminal outcomes, compression lineage, context-local turn identity |
 | 0.2.6 | 0.20.6 (2026.8.27) | `01740f352e2f2414b3bdb7791c2ed1f7bbb2b455` | 3.13.5 | Supported locally | 40 tests + installed contract probe; includes non-sensitive worker/verifier phase contract |
 | 0.2.5 | 0.20.6 (2026.8.27) | `01740f352e2f2414b3bdb7791c2ed1f7bbb2b455` | 3.13.5 | Supported locally | 39 tests + installed contract probe passed as part of extension-suite verification |
