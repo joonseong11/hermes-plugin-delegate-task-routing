@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.9] - 2026-09-21
+
+### Added
+
+- An authenticated, non-sensitive `delegation_lifecycle_for_turn` observer contract.
+- Worker/verifier completion-chain ownership so presentation plugins finalize only the delegations owned by the authenticated completion turn.
+- Durable one-time completion claims reject replayed envelopes, and retention prunes only consumed terminal records so live mandatory-verification chains cannot disappear.
+- `route_turn` guidance now documents `claude-opus-4-8` (anthropic) as the stable high-quality lane for demanding/long-context child work and the preferred choice when codex-family lanes hit rate limits or slow TTFB. Operators must also list the model in the `allowed_models` setting for it to be selectable.
+
 ## [0.2.8] - 2026-09-09
 
 ### Fixed

@@ -25,7 +25,7 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-PLUGIN_VERSION = "0.2.8"
+PLUGIN_VERSION = "0.2.9"
 PLUGIN_ID = "delegate-task-routing"
 _PATCH_MARKER = "_delegate_task_routing_plugin_v1"
 _ROUTE_FIELDS = ("label", "model", "reasoning_effort", "toolsets")
@@ -73,6 +73,7 @@ _FORCED_ROUTE_REQUESTS: set[str] = set()
 # cause), enforcement must give up for the turn instead of re-forcing until
 # the iteration budget burns out.
 _FORCED_ROUTE_COUNTS: dict[tuple[str, str], int] = {}
+_TURN_RISK_REQUIREMENTS: dict[tuple[str, str], bool | None] = {}
 _MAX_FORCED_ROUTE_ATTEMPTS = 3
 # Last reasoning effort observed in each Slack parent session's own LLM
 # request payload. registry.dispatch gives tool handlers no agent object, so
@@ -81,10 +82,33 @@ _MAX_FORCED_ROUTE_ATTEMPTS = 3
 # header keeps "unknown" rather than inventing one.
 _MAIN_EFFORTS: dict[str, str] = {}
 _PLUGIN_STATE: Any = None
+_DELEGATE_TASK_REQUEST_SCHEMA: dict[str, Any] | None = None
 _ENFORCED_PLATFORMS: set[str] = {"slack"}
 _HEADER_RE = re.compile(r"^_Alex:\s*[^\n]*_\s*\n*", re.IGNORECASE)
 _ASYNC_DELEGATION_RE = re.compile(
     r"\[ASYNC DELEGATION(?: BATCH)? COMPLETE — ([^\]]+)\]"
+)
+# Deterministic backstops complement the model-facing semantic policy. Explicit
+# high-risk intent must use worker_verifier; explicit routine/local intent must
+# not. Unclassified or genuinely ambiguous turns remain model-classified so a
+# lexical false negative cannot prohibit a conservative worker_verifier route.
+_HIGH_RISK_TURN_RE = re.compile(
+    r"(?:\b(?:send|post|publish|submit|deploy(?:ment)?s?|release|transfer|pay|"
+    r"account(?:ing)?|bookkeep(?:ing)?|invoice|reconcile|legal|security|"
+    r"permissions?|access[ -]?control|credentials?|production|prod|irreversible|"
+    r"high[- ](?:risk|impact|cost)|high[ -]error[ -]cost)\b|"
+    r"\bexternal\b.{0,32}\b(?:write|change|update|delete)\b|"
+    r"\b(?:write|change|update|delete)\b.{0,32}\bexternal\b|"
+    r"전송|게시|발행|제출|배포|릴리스|운영|프로덕션|금전|결제|회계|정산|법률|법무|보안|"
+    r"권한|접근.?제어|자격.?증명|되돌릴.?수.?없|비가역|고위험|오류.?비용|"
+    r"외부.{0,16}(?:쓰기|기록|변경|수정|삭제|업데이트))",
+    re.IGNORECASE,
+)
+_ORDINARY_TURN_RE = re.compile(
+    r"(?:\b(?:local|internal|reversible|routine|draft|notes?|unit[ -]?tests?|"
+    r"refactor|format|summari[sz]e|analysis|research)\b|"
+    r"로컬|내부|가역|되돌릴.?수.?있|일반|초안|메모|단위.?테스트|리팩터|포맷|요약|분석|조사)",
+    re.IGNORECASE,
 )
 
 ROUTE_TURN_SCHEMA = {
@@ -96,9 +120,20 @@ ROUTE_TURN_SCHEMA = {
         "answer immediately, because delegation runs in the background and sends "
         "the user a second message later; it must buy substantial independent "
         "work. Use single for one bounded chunk of substantial work; parallel "
-        "for two or more independent outcomes; worker_verifier for writes, "
-        "deployments, production operations, money, legal/security decisions, or "
-        "any result needing independent verification. When uncertain about RISK "
+        "for two or more independent outcomes. Ordinary local analysis, research, "
+        "implementation, and reversible file edits use direct, single, or parallel "
+        "according to scope. worker_verifier is reserved for and REQUIRED for "
+        "external writes (send/post/publish/submit), deployments or production "
+        "operations, money/accounting, legal or security work, permission/access "
+        "changes, irreversible actions, and other explicitly high-error-cost work. "
+        "Do not select worker_verifier for routine work merely because it includes "
+        "a local write or benefits from extra review. When risk is ambiguous, choose "
+        "worker_verifier. "
+        "For a user-requested skill refresh, choose direct with empty lanes, then call "
+        "skill_view for the changed skills before planning or editing; do not delegate "
+        "merely to reload skills. If refreshed instructions reveal a higher-risk scope, "
+        "call route_turn again before any write to declare the required lanes. "
+        "When uncertain about RISK "
         "choose the higher mode; when merely uncertain whether delegation is "
         "worth it, choose direct. With mode=direct, lanes MUST be the empty "
         "array []. "
@@ -111,11 +146,16 @@ ROUTE_TURN_SCHEMA = {
         "ambiguous multi-domain synthesis, architecture, long-context integration, "
         "or exceptionally difficult problems. Do not assign Astra when a lower "
         "model can safely complete the work; Astra does not replace Sol's "
-        "independent high-risk verification. Never assign Sol or Astra to trivial "
+        "independent high-risk verification. Claude-opus-4-8 (anthropic) is the "
+        "stable high-quality alternative for demanding or long-context child work, "
+        "and the preferred choice when codex-family lanes are hitting rate limits "
+        "or slow time-to-first-token; do not default every lane to it. Never assign Sol or Astra to trivial "
         "tasks; give identical tasks identical models. Declare the exact model, effort, and "
-        "least-privilege toolsets for every lane. Call route_turn at most once per "
-        "turn; never call it again after a plan is accepted, and never in an "
-        "async-delegation completion turn (routing is already recorded there)."
+        "least-privilege toolsets for every lane. Normally call route_turn once per "
+        "turn. Only a direct skill-refresh preflight may reroute before any write "
+        "when the refreshed instructions require a higher-risk mode. Never reroute "
+        "an accepted delegation or an async-delegation completion/verification turn "
+        "(routing is already recorded there)."
     ),
     "parameters": {
         "type": "object",
@@ -621,6 +661,31 @@ def delegation_phase_for_turn(session_id: Any, turn_id: Any) -> str:
     return "worker"
 
 
+def delegation_lifecycle_for_turn(session_id: Any, turn_id: Any) -> dict[str, Any]:
+    """Return an authenticated, non-sensitive lifecycle view for observers.
+
+    The plan is created by this plugin only after route validation or durable
+    async-completion authentication.  Presentation plugins can therefore use
+    it without parsing user-controlled completion-marker text.  No goals,
+    labels, model names, toolsets, or result payloads are exposed.
+    """
+    with _POLICY_LOCK:
+        plan = _TURN_PLANS.get(_turn_key(session_id, turn_id))
+        if not isinstance(plan, Mapping):
+            return {"mode": "unrouted", "delegation_ids": []}
+        mode = str(plan.get("mode") or "unrouted")
+        ids: list[str] = []
+        for value in (
+            *(plan.get("owned_delegation_ids") or []),
+            plan.get("source_delegation_id"),
+            plan.get("delegation_id"),
+        ):
+            value = str(value or "").strip()
+            if value and value not in ids:
+                ids.append(value)
+        return {"mode": mode, "delegation_ids": ids, "dispatched": bool(plan.get("dispatched"))}
+
+
 def _resolve_turn_context(parent_agent: Any, kw: Mapping[str, Any]) -> tuple[str, str]:
     """Resolve (session_id, turn_id) for a tool-handler invocation.
 
@@ -645,11 +710,27 @@ def _resolve_turn_context(parent_agent: Any, kw: Mapping[str, Any]) -> tuple[str
 
 
 def _is_enforced_parent(*, platform: Any, task_id: Any, parent_session_id: Any = "") -> bool:
-    if str(platform or "").lower() not in _ENFORCED_PLATFORMS:
+    platform_value = getattr(platform, "value", platform)
+    if str(platform_value or "").lower() not in _ENFORCED_PLATFORMS:
         return False
     if str(task_id or "").startswith("sa-") or str(parent_session_id or ""):
         return False
     return True
+
+
+def _worker_verifier_requirement(user_message: Any) -> bool | None:
+    """Classify only deterministic risk boundaries; leave ambiguous turns semantic."""
+    message = str(user_message or "")
+    if _HIGH_RISK_TURN_RE.search(message):
+        return True
+    if _ORDINARY_TURN_RE.search(message):
+        return False
+    return None
+
+
+def _requires_worker_verifier(user_message: Any) -> bool:
+    """Return whether this turn crosses the deterministic high-risk boundary."""
+    return _worker_verifier_requirement(user_message) is True
 
 
 def _validate_plan(
@@ -658,12 +739,17 @@ def _validate_plan(
     allowed_models: Sequence[str],
     allowed_efforts: Sequence[str],
     allowed_toolsets: Sequence[str],
+    require_worker_verifier: bool | None = None,
 ) -> dict[str, Any]:
     mode = str(payload.get("mode") or "").strip().lower()
     reason = str(payload.get("reason") or "").strip()
     lanes = payload.get("lanes")
     if mode not in {"direct", "single", "parallel", "worker_verifier"}:
         raise ValueError("mode must be direct, single, parallel, or worker_verifier")
+    if require_worker_verifier is True and mode != "worker_verifier":
+        raise ValueError("worker_verifier is required for this high-risk turn")
+    if require_worker_verifier is False and mode == "worker_verifier":
+        raise ValueError("worker_verifier is reserved for high-risk turns")
     if not reason:
         raise ValueError("reason is required")
     if not isinstance(lanes, list):
@@ -809,7 +895,7 @@ def _load_actual_routes(delegation_id: str) -> list[dict[str, Any]]:
         from hermes_constants import get_hermes_home
 
         db = Path(get_hermes_home()) / "state.db"
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        con = sqlite3.connect(f"file:{db}?immutable=1", uri=True)
         row = con.execute(
             "SELECT event_json FROM async_delegations WHERE delegation_id = ?",
             (delegation_id,),
@@ -847,16 +933,55 @@ def _persist_delegation_policy(delegation_id: str, record: Mapping[str, Any]) ->
         records = _durable_delegations()
         records[delegation_id] = dict(record)
         if len(records) > 100:
-            ordered = sorted(
-                records,
+            prunable = sorted(
+                (key for key, value in records.items()
+                 if str(value.get("stage") or "") in {"workers_consumed", "verifiers_consumed", "completion_consumed", "policy_error"}),
                 key=lambda key: float(records[key].get("created_at") or 0),
             )
-            for key in ordered[:-80]:
-                records.pop(key, None)
+            while len(records) > 80 and prunable:
+                records.pop(prunable.pop(0), None)
         _PLUGIN_STATE.set("delegations", records)
     except Exception as exc:
         _LOG.warning("Could not persist orchestration state %s: %s", delegation_id, exc)
         raise RuntimeError("could not persist mandatory verification state") from exc
+
+
+def _claim_completion_once(delegation_id: str, session_id: str, turn_id: str) -> dict[str, Any] | None:
+    """Atomically reserve one authenticated completion envelope per gateway process.
+
+    The durable stage makes replays fail closed across restarts. Active worker and
+    verifier chains remain non-prunable until their continuation is dispatched or
+    their final result is consumed.
+    """
+    with _POLICY_LOCK:
+        records = _durable_delegations()
+        current = records.get(delegation_id)
+        if isinstance(current, Mapping):
+            record = dict(current)
+            if not _owned_session(str(record.get("parent_session_id") or ""), session_id):
+                return None
+            stage = str(record.get("stage") or "")
+            if stage not in {"workers_dispatched", "verifiers_dispatched"}:
+                return None
+            claimed_stage = "workers_completion_claimed" if stage == "workers_dispatched" else "verifiers_completion_claimed"
+        else:
+            record = {"parent_session_id": session_id, "created_at": time.time()}
+            stage = "ordinary"
+            claimed_stage = "completion_consumed"
+        record.update(stage=claimed_stage, claimed_turn_id=turn_id, updated_at=time.time())
+        _persist_delegation_policy(delegation_id, record)
+        record["claimed_from_stage"] = stage
+        return record
+
+
+def _mark_completion_consumed(delegation_id: str, stage: str) -> None:
+    with _POLICY_LOCK:
+        record = _durable_delegations().get(delegation_id)
+        if not isinstance(record, Mapping):
+            return
+        updated = dict(record)
+        updated.update(stage=stage, updated_at=time.time())
+        _persist_delegation_policy(delegation_id, updated)
 
 
 def _compression_tip(con: sqlite3.Connection, session_id: str) -> str:
@@ -900,7 +1025,7 @@ def _owned_session(
         if con is None:
             from hermes_constants import get_hermes_home
             con = sqlite3.connect(
-                f"file:{Path(get_hermes_home()) / 'state.db'}?mode=ro", uri=True
+                f"file:{Path(get_hermes_home()) / 'state.db'}?immutable=1", uri=True
             )
             close = True
         return _compression_tip(con, owner) == delivery
@@ -919,7 +1044,7 @@ def _verified_completion_routes(
         from hermes_constants import get_hermes_home
 
         db = Path(get_hermes_home()) / "state.db"
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        con = sqlite3.connect(f"file:{db}?immutable=1", uri=True)
         row = con.execute(
             "SELECT state, parent_session_id, event_json "
             "FROM async_delegations WHERE delegation_id = ?",
@@ -991,11 +1116,15 @@ def _mark_delegation_dispatch(plan: dict[str, Any], parsed: Mapping[str, Any]) -
                 {
                     "stage": "verifiers_dispatched",
                     "parent_session_id": plan.get("parent_session_id") or "",
+                    "source_delegation_id": plan.get("source_delegation_id") or "",
                     "lanes": plan.get("original_lanes") or plan.get("lanes") or [],
                     "prior_routes": plan.get("prior_routes") or [],
                     "created_at": time.time(),
                 },
             )
+            source_delegation_id = str(plan.get("source_delegation_id") or "").strip()
+            if source_delegation_id:
+                _mark_completion_consumed(source_delegation_id, "workers_consumed")
         except RuntimeError:
             plan["mode"] = "policy_error"
             plan["dispatched"] = False
@@ -1027,6 +1156,9 @@ def _pre_llm_policy(**kwargs: Any) -> Any:
         if len(_FORCED_ROUTE_COUNTS) > 500:
             for key in list(_FORCED_ROUTE_COUNTS)[:-400]:
                 _FORCED_ROUTE_COUNTS.pop(key, None)
+        if len(_TURN_RISK_REQUIREMENTS) > 500:
+            for key in list(_TURN_RISK_REQUIREMENTS)[:-400]:
+                _TURN_RISK_REQUIREMENTS.pop(key, None)
         if len(_FORCED_ROUTE_REQUESTS) > 500:
             _FORCED_ROUTE_REQUESTS.clear()
         if not enforced:
@@ -1036,13 +1168,13 @@ def _pre_llm_policy(**kwargs: Any) -> Any:
     message = str(kwargs.get("user_message") or "")
     match = _ASYNC_DELEGATION_RE.search(message)
     if not match:
+        with _POLICY_LOCK:
+            _TURN_RISK_REQUIREMENTS[_turn_key(session_id, turn_id)] = (
+                _worker_verifier_requirement(message)
+            )
         return None
     delegation_id = match.group(1).strip()
     actual = _verified_completion_routes(delegation_id, session_id)
-    record = _durable_delegations().get(delegation_id)
-    record_matches_session = isinstance(record, Mapping) and _owned_session(
-        str(record.get("parent_session_id") or ""), session_id
-    )
     if not actual:
         with _POLICY_LOCK:
             _TURN_PLANS[_turn_key(session_id, turn_id)] = {
@@ -1061,7 +1193,17 @@ def _pre_llm_policy(**kwargs: Any) -> Any:
                 "verifiers or claim completion."
             )
         }
-    if record_matches_session and record.get("stage") == "workers_dispatched":
+    record = _claim_completion_once(delegation_id, session_id, turn_id)
+    if record is None:
+        with _POLICY_LOCK:
+            _TURN_PLANS[_turn_key(session_id, turn_id)] = {
+                "mode": "policy_error", "reason": "async completion was already consumed",
+                "lanes": [], "actual_routes": [], "dispatched": False,
+                "delegation_id": delegation_id, "created_at": time.time(),
+            }
+        return {"context": "This authenticated async completion was already consumed. Do not dispatch or answer it again."}
+    claimed_from_stage = str(record.get("claimed_from_stage") or "")
+    if claimed_from_stage == "workers_dispatched":
         original_lanes = list(record.get("lanes") or [])
         verifiers = [lane for lane in original_lanes if lane.get("phase") == "verifier"]
         plan = {
@@ -1089,8 +1231,14 @@ def _pre_llm_policy(**kwargs: Any) -> Any:
                 "already recorded; call delegate_task directly."
             )
         }
-    if record_matches_session and record.get("stage") == "verifiers_dispatched":
+    if claimed_from_stage == "verifiers_dispatched":
         actual = list(record.get("prior_routes") or []) + actual
+    owned_delegation_ids = [delegation_id]
+    if claimed_from_stage == "verifiers_dispatched":
+        source_delegation_id = str(record.get("source_delegation_id") or "").strip()
+        if source_delegation_id and source_delegation_id not in owned_delegation_ids:
+            owned_delegation_ids.insert(0, source_delegation_id)
+        _mark_completion_consumed(delegation_id, "verifiers_consumed")
     with _POLICY_LOCK:
         _TURN_PLANS[_turn_key(session_id, turn_id)] = {
             "mode": "completion",
@@ -1099,6 +1247,7 @@ def _pre_llm_policy(**kwargs: Any) -> Any:
             "actual_routes": actual,
             "dispatched": True,
             "delegation_id": delegation_id,
+            "owned_delegation_ids": owned_delegation_ids,
             "created_at": time.time(),
         }
     if actual:
@@ -1208,14 +1357,17 @@ def _route_turn_enforceable() -> bool:
         return True
 
 
-def _ensure_route_tool_declared(
-    request: dict[str, Any], api_mode: Any
+def _ensure_tool_declared(
+    request: dict[str, Any], api_mode: Any, schema: Mapping[str, Any]
 ) -> dict[str, Any]:
-    """Keep route_turn provider-visible even when tool_search defers it."""
+    """Inject one provider-native tool declaration idempotently."""
     mode = str(api_mode or "").lower()
-    name = ROUTE_TURN_SCHEMA["name"]
-    description = ROUTE_TURN_SCHEMA["description"]
-    parameters = ROUTE_TURN_SCHEMA["parameters"]
+    name = str(schema.get("name") or "").strip()
+    description = str(schema.get("description") or "")
+    parameters = schema.get("parameters")
+    if not name or not isinstance(parameters, Mapping):
+        raise RuntimeError("forced tool schema is unavailable or invalid")
+    parameters = dict(parameters)
     if mode == "bedrock_converse":
         tool_config = dict(request.get("toolConfig") or {})
         tools = list(tool_config.get("tools") or [])
@@ -1279,6 +1431,13 @@ def _ensure_route_tool_declared(
             )
     request["tools"] = tools
     return request
+
+
+def _ensure_route_tool_declared(
+    request: dict[str, Any], api_mode: Any
+) -> dict[str, Any]:
+    """Keep route_turn provider-visible even when tool_search defers it."""
+    return _ensure_tool_declared(request, api_mode, ROUTE_TURN_SCHEMA)
 
 
 def _llm_request_policy(request: dict[str, Any], **kwargs: Any) -> Any:
@@ -1359,6 +1518,11 @@ def _llm_request_policy(request: dict[str, Any], **kwargs: Any) -> Any:
         "dispatched"
     ):
         api_mode = kwargs.get("api_mode")
+        if not isinstance(_DELEGATE_TASK_REQUEST_SCHEMA, Mapping):
+            raise RuntimeError("delegate_task request schema was not retained at plugin registration")
+        rewritten = _ensure_tool_declared(
+            rewritten, api_mode, _DELEGATE_TASK_REQUEST_SCHEMA
+        )
         choice = _forced_tool_choice("delegate_task", api_mode)
         if str(api_mode or "").lower() == "bedrock_converse":
             tool_config = dict(rewritten.get("toolConfig") or {})
@@ -1469,7 +1633,7 @@ def _transform_header(response_text: str, session_id: str, model: str, **kwargs:
 
 
 def register(ctx) -> None:
-    global _PLUGIN_STATE
+    global _PLUGIN_STATE, _DELEGATE_TASK_REQUEST_SCHEMA
     import tools.delegate_tool as delegate_module
 
     _PLUGIN_STATE = ctx.state
@@ -1506,6 +1670,7 @@ def register(ctx) -> None:
             allowed_efforts=allowed_efforts,
             allowed_toolsets=allowed_toolsets,
         )
+        _DELEGATE_TASK_REQUEST_SCHEMA = copy.deepcopy(schema)
 
         def route_handler(args: dict[str, Any], **kw: Any):
             parent_agent = kw.get("parent_agent")
@@ -1546,6 +1711,7 @@ def register(ctx) -> None:
                     allowed_models=allowed_models,
                     allowed_efforts=allowed_efforts,
                     allowed_toolsets=allowed_toolsets,
+                    require_worker_verifier=_TURN_RISK_REQUIREMENTS.get(guard_key),
                 )
                 parent_sets = set(getattr(parent_agent, "enabled_toolsets", None) or [])
                 for index, lane in enumerate(plan["lanes"]):

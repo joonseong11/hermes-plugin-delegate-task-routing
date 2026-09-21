@@ -42,6 +42,12 @@ def base_schema():
     }
 
 
+@pytest.fixture(autouse=True)
+def retained_delegate_request_schema(monkeypatch):
+    """Model the schema retained by register() for middleware-only unit tests."""
+    monkeypatch.setattr(plugin, "_DELEGATE_TASK_REQUEST_SCHEMA", base_schema())
+
+
 class FakeChild:
     def __init__(self, *, model, toolsets, parent):
         self.model = model or parent.model
@@ -428,6 +434,76 @@ def test_route_plan_modes_and_worker_verifier_phases():
     assert {lane["phase"] for lane in plan["lanes"]} == {"worker", "verifier"}
 
 
+def test_worker_verifier_is_forced_only_at_the_high_risk_boundary():
+    ordinary = (
+        "Summarize these local notes and update a draft.",
+        "로컬 코드 수정 후 테스트를 실행해줘",
+    )
+    high_risk = (
+        "Write the approved update to the external system.",
+        "Handle the deployments.",
+        "Change production configuration.",
+        "Transfer funds.",
+        "Complete the accounting close.",
+        "Review this legal decision.",
+        "Perform a security change.",
+        "Change the team permissions.",
+        "Perform this irreversible action.",
+        "This ambiguous task has high error cost.",
+        "외부 시스템에 변경 사항을 기록해줘.",
+        "프로덕션 배포 전 독립 검증을 해줘",
+        "Publish the approved response to the external channel",
+    )
+    assert all(plugin._worker_verifier_requirement(text) is False for text in ordinary)
+    assert all(plugin._worker_verifier_requirement(text) is True for text in high_risk)
+    assert plugin._worker_verifier_requirement("Handle this unusual sensitive change carefully.") is None
+
+    direct = {"mode": "direct", "reason": "routine", "lanes": []}
+    with pytest.raises(ValueError, match="required for this high-risk"):
+        plugin._validate_plan(
+            direct,
+            allowed_models=settings("allowed_models"),
+            allowed_efforts=settings("allowed_reasoning_efforts"),
+            allowed_toolsets=settings("allowed_toolsets"),
+            require_worker_verifier=True,
+        )
+
+    worker = {
+        "label": "작업",
+        "phase": "worker",
+        "model": "gpt-5.6-terra-900k",
+        "reasoning_effort": "high",
+        "toolsets": ["file"],
+    }
+    verifier = {
+        "label": "검수",
+        "phase": "verifier",
+        "model": "gpt-5.6-sol-900k",
+        "reasoning_effort": "high",
+        "toolsets": ["file"],
+    }
+    worker_verifier = {
+        "mode": "worker_verifier",
+        "reason": "production deployment",
+        "lanes": [worker, verifier],
+    }
+    assert plugin._validate_plan(
+        worker_verifier,
+        allowed_models=settings("allowed_models"),
+        allowed_efforts=settings("allowed_reasoning_efforts"),
+        allowed_toolsets=settings("allowed_toolsets"),
+        require_worker_verifier=True,
+    )["mode"] == "worker_verifier"
+    with pytest.raises(ValueError, match="reserved for high-risk"):
+        plugin._validate_plan(
+            worker_verifier,
+            allowed_models=settings("allowed_models"),
+            allowed_efforts=settings("allowed_reasoning_efforts"),
+            allowed_toolsets=settings("allowed_toolsets"),
+            require_worker_verifier=False,
+        )
+
+
 def test_llm_request_policy_forces_route_then_delegate():
     plugin._ENFORCED_PLATFORMS = {"slack"}
     key = plugin._turn_key("parent-session", "turn-1")
@@ -676,6 +752,15 @@ def test_worker_verifier_is_sequenced_across_async_completions(monkeypatch):
     verify_plan = plugin._TURN_PLANS[plugin._turn_key("parent", "verify-turn")]
     assert verify_plan["mode"] == "verification"
     assert verify_plan["expected_lanes"] == [verifier]
+    assert plugin.delegation_lifecycle_for_turn("parent", "verify-turn") == {
+        "mode": "verification", "delegation_ids": ["deleg-workers"], "dispatched": False,
+    }
+    plugin._pre_llm_policy(
+        session_id="parent", turn_id="replayed-worker", task_id="parent-task",
+        platform="slack", parent_session_id="",
+        user_message="[ASYNC DELEGATION BATCH COMPLETE — deleg-workers]",
+    )
+    assert plugin._TURN_PLANS[plugin._turn_key("parent", "replayed-worker")]["mode"] == "policy_error"
     forced = plugin._llm_request_policy(
         {"input": []},
         session_id="parent",
@@ -699,6 +784,46 @@ def test_worker_verifier_is_sequenced_across_async_completions(monkeypatch):
     final_plan = plugin._TURN_PLANS[plugin._turn_key("parent", "final-turn")]
     assert final_plan["mode"] == "completion"
     assert [x["label"] for x in final_plan["actual_routes"]] == ["구현", "기술검수"]
+    assert final_plan["owned_delegation_ids"] == ["deleg-workers", "deleg-verifiers"]
+    assert plugin.delegation_lifecycle_for_turn("parent", "final-turn") == {
+        "mode": "completion",
+        "delegation_ids": ["deleg-workers", "deleg-verifiers"],
+        "dispatched": True,
+    }
+    plugin._pre_llm_policy(
+        session_id="parent", turn_id="replayed-verifier", task_id="parent-task",
+        platform="slack", parent_session_id="",
+        user_message="[ASYNC DELEGATION BATCH COMPLETE — deleg-verifiers]",
+    )
+    assert plugin._TURN_PLANS[plugin._turn_key("parent", "replayed-verifier")]["mode"] == "policy_error"
+
+
+def test_lifecycle_contract_does_not_expose_route_payloads():
+    platform = type("PlatformValue", (), {"value": "slack"})()
+    assert plugin._is_enforced_parent(platform=platform, task_id="parent", parent_session_id="")
+    with plugin._POLICY_LOCK:
+        plugin._TURN_PLANS[plugin._turn_key("observer", "turn")] = {
+            "mode": "parallel", "delegation_id": "deleg-safe", "dispatched": True,
+            "reason": "secret reason", "lanes": [{"goal": "secret goal", "model": "secret model"}],
+        }
+    assert plugin.delegation_lifecycle_for_turn("observer", "turn") == {
+        "mode": "parallel", "delegation_ids": ["deleg-safe"], "dispatched": True,
+    }
+
+
+def test_retention_never_prunes_live_verification_chains():
+    plugin._PLUGIN_STATE = FakeState()
+    live = {
+        f"live-{index}": {"stage": "workers_dispatched", "parent_session_id": "parent", "created_at": index}
+        for index in range(101)
+    }
+    plugin._PLUGIN_STATE.set("delegations", live)
+    plugin._persist_delegation_policy(
+        "consumed", {"stage": "completion_consumed", "parent_session_id": "parent", "created_at": -1},
+    )
+    saved = dict(plugin._PLUGIN_STATE.get("delegations", {}) or {})
+    assert all(f"live-{index}" in saved for index in range(101))
+    assert "consumed" not in saved
 
 
 @pytest.mark.parametrize(
@@ -1258,3 +1383,28 @@ def test_policy_error_uses_precise_unverified_label():
     out=plugin._transform_header("본문",sid,"gpt-5.6-sol-900k",turn_id="turn")
     assert "위임 기록 만료 · 실행경로 미검증" in out
     assert "실행정보 확인 실패" not in out
+
+
+def test_routine_work_guidance_preserves_worker_verifier_boundary():
+    description = plugin.ROUTE_TURN_SCHEMA["description"]
+    assert "Ordinary local analysis, research" in description
+    assert "reversible file edits use direct, single, or parallel" in description
+    assert "external writes (send/post/publish/submit)" in description
+    assert "Do not select worker_verifier for routine work" in description
+
+
+def test_skill_refresh_uses_direct_before_reclassifying_work():
+    description = plugin.ROUTE_TURN_SCHEMA["description"]
+    assert "skill refresh" in description
+    assert "route_turn again before any write" in description
+
+
+def test_localized_direct_route_allows_skill_read_and_final_verification(monkeypatch):
+    monkeypatch.setattr(plugin, "_ENFORCED_PLATFORMS", {"slack"})
+    key = plugin._turn_key("localized-figma-test", "turn-local")
+    monkeypatch.setitem(plugin._TURN_PLANS, key, {"mode": "direct", "lanes": [], "dispatched": False})
+    context = dict(session_id="localized-figma-test", turn_id="turn-local",
+                   task_id="parent-task", platform="slack")
+    for tool in ("skill_view", "mcp__figma__use_figma", "mcp__figma__get_screenshot"):
+        assert plugin._pre_tool_policy(tool, **context) is None
+    assert plugin._llm_request_policy({"messages": []}, api_mode="chat_completions", **context) is None

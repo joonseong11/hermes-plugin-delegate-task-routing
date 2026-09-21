@@ -1,10 +1,18 @@
 # delegate-task-routing
 
-Current release: `v0.2.8`. See [COMPATIBILITY.md](COMPATIBILITY.md) before changing the Hermes version and [CHANGELOG.md](CHANGELOG.md) for release history.
+Current release: `v0.2.9`. See [COMPATIBILITY.md](COMPATIBILITY.md) before changing the Hermes version and [CHANGELOG.md](CHANGELOG.md) for release history.
 
 Persistent, in-process orchestration policy for Hermes. It forces a per-turn execution decision on Slack parent sessions, applies exact-allowlisted per-task routing, records requested versus actual child execution, and deterministically prepends the `_Alex: ..._` execution header.
 
 ## Per-turn policy
+
+### Localized Figma edits and refreshed skills
+
+Clear icon/color/copy/alignment/spacing/visibility edits use direct execution when they do not change shared component definitions, Variant/Property schemas, navigation contracts, or permissions. The parent reloads user-requested changed skills, preserves user changes, records each external write, and reads back and visually checks every changed screen. Repeating the same local change on several screens is not itself a reason to delegate.
+
+Routing remains the first tool call. A requested skill refresh selects direct with empty lanes before skill_view. If that read reveals higher-risk work, the parent reroutes before any write. Already-delegated work and completion/verifier turns retain their existing routing; this is not a general route-reset permission.
+
+This is model-facing classification guidance, not an automatic Figma risk classifier. Its effect must be checked in actual task traces. Changing these Python files does not hot-reload an already imported plugin; no gateway restart is performed as part of this file-only change.
 
 Every normal Slack parent turn must call `route_turn` first. LLM request middleware forces that exact tool choice until a valid decision exists:
 
