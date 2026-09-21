@@ -9,7 +9,7 @@ All notable changes to this project are documented here.
 - An authenticated, non-sensitive `delegation_lifecycle_for_turn` observer contract.
 - Worker/verifier completion-chain ownership so presentation plugins finalize only the delegations owned by the authenticated completion turn.
 - Durable one-time completion claims reject replayed envelopes, and retention prunes only consumed terminal records so live mandatory-verification chains cannot disappear.
-- `route_turn` guidance now documents `claude-opus-4-8` (anthropic) as the stable high-quality lane for demanding/long-context child work and the preferred choice when codex-family lanes hit rate limits or slow TTFB. Operators must also list the model in the `allowed_models` setting for it to be selectable.
+- `route_turn` guidance now documents `claude-opus-4-8`, `claude-sonnet-5`, and `claude-fable-5.1` (anthropic) as selectable child lanes: sonnet-5 as a Terra-class general lane, opus-4-8 as a Sol-class high-quality/high-risk lane, and fable-5.1 (1M context) as an Astra-class very-large-context lane. Claude lanes are the preferred stable path when codex-family lanes are rate-limited (HTTP 429) or slow to first token. Operators must also list each model in the `allowed_models` setting for it to be selectable.
 
 ## [0.2.8] - 2026-09-09
 
