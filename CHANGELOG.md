@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.1] - Unreleased (local)
+
+- Added profile-scoped development task review checkpoints, exact git-tree fingerprints, independent single-lane review verdict authenticated from the core async ledger, safe progress and fail-closed final-output readiness for scoped Slack development tasks. Reviewed revisions are reused; later changes invalidate readiness. High-risk worker/verifier routing remains mandatory.
+- Added hermetic review-gate contracts and a self-deployment refusal for installations where the git checkout is the live plugin directory. Gateway activation and platform smoke testing remain pending.
+
+## [0.3.0] - Unreleased (local)
+
+### Changed
+
+- Default model roster is exactly Opus 4.8, Fable 5.1, GPT-6 Astra, Sol, Luna and Sonnet 5. Guidance assigns Luna simple work, Sol general work (unchanged delegation default), Sonnet the general/medium Claude alternative, Opus critical independent verification/Codex recovery, Astra exceptional architecture, and Fable extreme long context. Existing direct/single/parallel/worker_verifier risk policy is unchanged.
+- Cross-provider routed lanes resolve the target provider's complete credential bundle instead of inheriting the wrong endpoint. Automatic recovery is now independent of that resolution and also covers same-provider Codex parent/child routes.
+- Exact recovery map: GPT-6 Luna→Sonnet, Sol→Opus, Astra→Fable. Sonnet is explicitly authorized as the sixth model and supplies cost-appropriate Luna outage recovery. Unknown IDs have no guessed peer; absent peers disable automatic fallback.
+- Explicit fallback chains must use allowlisted models and matching native providers. Malformed or unauthorized chains fail closed; explicit disable and trusted credential/transport overrides are respected without shared-config mutation.
+- Local manifest/documentation version aligned with the existing 0.3.0 code. No external release or gateway restart; fresh live schema/actual-route verification remains pending operator activation.
+
+### Tests
+
+- Added focused roster, exact-peer, same/cross-provider recovery, allowlist, trusted-override, native-chain normalization and risk-policy regressions.
+
 ## [0.2.9] - 2026-09-21
 
 ### Added

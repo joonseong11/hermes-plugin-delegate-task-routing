@@ -21,6 +21,7 @@ done
 payload=(
   __init__.py plugin.yaml README.md CHANGELOG.md COMPATIBILITY.md LICENSE
   tests/test_routing.py
+  tests/test_development_review.py tests/test_five_model_policy.py tests/test_risk_policy.py
   docs/SLACK_SMOKE_TEST.md
   scripts/verify.sh scripts/deploy.sh scripts/rollback.sh scripts/pre-update-check.sh
   scripts/check-version.sh
@@ -32,6 +33,14 @@ if [[ $APPLY -eq 0 ]]; then
   for file in "${payload[@]}"; do printf 'would install %s\n' "$file"; done
   [[ $ENABLE -eq 1 ]] && printf 'would enable plugin and grant tools.override\n'
   exit 0
+fi
+
+# This checkout is also the live plugin directory on some installations.
+# Moving it would strand its .git metadata in the rollback backup and replace
+# the working checkout with a reduced payload. It is already staged in place.
+if [[ "$(realpath "$ROOT")" == "$(realpath "$TARGET")" ]]; then
+  printf 'Refusing self-deployment of the live plugin checkout; files are already staged in place. Verify, then arrange an external gateway restart.\n' >&2
+  exit 2
 fi
 
 mkdir -p "$PLUGIN_PARENT"
@@ -74,4 +83,4 @@ COMMITTED=1
 trap - EXIT
 printf 'deployment file comparison: PASS\n'
 [[ -d "$BACKUP" ]] && printf 'rollback backup: %s\n' "$BACKUP"
-printf 'Gateway restart is intentionally not automatic. Run /restart from Slack, then follow docs/SLACK_SMOKE_TEST.md.\n'
+printf 'Gateway restart is intentionally not automatic. After an independently reviewed diff, safe session-store snapshot and active-child check, restart from an EXTERNAL host shell; then follow docs/SLACK_SMOKE_TEST.md.\n'

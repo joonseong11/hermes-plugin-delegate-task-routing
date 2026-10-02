@@ -15,9 +15,11 @@ if [[ ! -x "$HERMES_PYTHON" ]]; then
   exit 2
 fi
 
-python3 -m py_compile "$PLUGIN_UNDER_TEST" "$ROOT/tests/test_routing.py"
+python3 -B -c 'import pathlib, sys; [compile(pathlib.Path(p).read_text(), p, "exec") for p in sys.argv[1:]]' \
+  "$PLUGIN_UNDER_TEST" "$ROOT/tests/"*.py
 PYTHONPATH="$HERMES_SRC:${HERMES_SRC}/.venv/lib/python3.13/site-packages${PYTHONPATH:+:$PYTHONPATH}" \
-  PLUGIN_PATH="$PLUGIN_UNDER_TEST" uv run --no-project --with pytest python -m pytest -q "$ROOT/tests/test_routing.py"
+  PLUGIN_PATH="$PLUGIN_UNDER_TEST" uv run --no-project --with pytest python -B -m pytest \
+    -o 'addopts=' -p no:cacheprovider -q "$ROOT/tests"
 
 PYTHONPATH="$HERMES_SRC:${HERMES_SRC}/.venv/lib/python3.13/site-packages${PYTHONPATH:+:$PYTHONPATH}" \
 PLUGIN_PATH="$PLUGIN_UNDER_TEST" "$HERMES_PYTHON" - <<'PY'

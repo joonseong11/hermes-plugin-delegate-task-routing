@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import sqlite3
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -136,6 +137,11 @@ def settings(key, default=None):
             "gpt-5.6-terra-900k",
             "gpt-5.6-sol-900k",
             "gpt-6-astra",
+            "gpt-6.1-sol",
+            "gpt-6-luna",
+            "claude-opus-4-8",
+            "claude-fable-5.1",
+            "claude-sonnet-5",
         ],
         "allowed_reasoning_efforts": ["low", "medium", "high", "xhigh", "max"],
         "allowed_toolsets": ["web", "file", "terminal", "code_execution", "reader_db"],
@@ -302,6 +308,126 @@ def test_native_post_build_toolset_broadening_fails_closed():
         )
         assert "error" in data
         assert "broadened requested toolsets" in data["error"]
+    finally:
+        unload()
+
+
+def anthropic_parent():
+    """Parent running on anthropic (e.g. claude-opus) — the real gateway state
+    that makes a gpt-* lane cross-provider."""
+    return SimpleNamespace(
+        model="claude-opus-4-8",
+        provider="anthropic",
+        enabled_toolsets=["web", "file", "terminal", "code_execution", "reader_db"],
+        reasoning_config={"enabled": True, "effort": "medium"},
+    )
+
+
+def _install_capturing_creds(monkeypatch):
+    """Make the plugin's cross-provider credential resolution hermetic: return a
+    fixed codex bundle instead of hitting the live provider system."""
+    import types
+
+    fake_bundle = {
+        "model": None,
+        "provider": "openai-codex",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api_key": "codex-key",
+        "api_mode": "codex_responses",
+        "request_overrides": {},
+    }
+
+    def fake_resolve(cfg, parent_agent):
+        out = dict(fake_bundle)
+        out["model"] = cfg.get("model")
+        return out
+
+    fake_mod = types.ModuleType("tools.delegate_tool_config")
+    fake_mod._resolve_delegation_credentials = fake_resolve
+    monkeypatch.setitem(sys.modules, "tools.delegate_tool_config", fake_mod)
+
+
+def test_cross_provider_lane_pins_provider_and_fallback(monkeypatch):
+    """A gpt-* lane on an anthropic parent must pin openai-codex creds AND get an
+    Anthropic-peer fallback chain, instead of inheriting anthropic and 404ing."""
+    _install_capturing_creds(monkeypatch)
+    module = fake_module()
+    captured = {}
+    original_builder = module._build_child_preserving_parent_tools
+
+    def capturing_builder(*args, **kwargs):
+        captured.update(kwargs)
+        return original_builder(*args, **kwargs)
+
+    module._build_child_preserving_parent_tools = capturing_builder
+    unload = plugin._install_patches(module, get_config=settings)
+    try:
+        module.delegate_task(
+            tasks=[routed_task(model="gpt-6.1-sol", effort="high", toolsets=["file"])],
+            parent_agent=anthropic_parent(),
+        )
+        assert captured.get("override_provider") == "openai-codex"
+        assert captured.get("override_base_url") == "https://chatgpt.com/backend-api/codex"
+        assert captured.get("override_api_key") == "codex-key"
+        assert captured.get("override_api_mode") == "codex_responses"
+        chain = (captured.get("routing_cfg") or {}).get("fallback_providers")
+        assert chain == [{"provider": "anthropic", "model": "claude-opus-4-8"}]
+    finally:
+        unload()
+
+
+def test_cross_provider_fallback_peer_matches_tier(monkeypatch):
+    """Luna→Sonnet, Sol→Opus, Astra→Fable; no generation-prefix escalation."""
+    _install_capturing_creds(monkeypatch)
+    for lane_model, expected_peer in (
+        ("gpt-6.1-sol", "claude-opus-4-8"),
+        ("gpt-6-astra", "claude-fable-5.1"),
+        ("gpt-6-luna", "claude-sonnet-5"),
+    ):
+        module = fake_module()
+        captured = {}
+        original_builder = module._build_child_preserving_parent_tools
+
+        def capturing_builder(*args, __cap=captured, __orig=original_builder, **kwargs):
+            __cap.update(kwargs)
+            return __orig(*args, **kwargs)
+
+        module._build_child_preserving_parent_tools = capturing_builder
+        unload = plugin._install_patches(module, get_config=settings)
+        try:
+            module.delegate_task(
+                tasks=[routed_task(model=lane_model, effort="high", toolsets=["file"])],
+                parent_agent=anthropic_parent(),
+            )
+            chain = (captured.get("routing_cfg") or {}).get("fallback_providers")
+            assert chain == [{"provider": "anthropic", "model": expected_peer}], lane_model
+        finally:
+            unload()
+
+
+def test_same_provider_lane_does_not_override(monkeypatch):
+    """When the parent already runs openai-codex, a gpt-* lane must NOT inject an
+    override_provider, but approved fallback must still be available."""
+    _install_capturing_creds(monkeypatch)
+    module = fake_module()
+    captured = {}
+    original_builder = module._build_child_preserving_parent_tools
+
+    def capturing_builder(*args, **kwargs):
+        captured.update(kwargs)
+        return original_builder(*args, **kwargs)
+
+    module._build_child_preserving_parent_tools = capturing_builder
+    unload = plugin._install_patches(module, get_config=settings)
+    try:
+        module.delegate_task(
+            tasks=[routed_task(model="gpt-6-luna", effort="high", toolsets=["file"])],
+            parent_agent=parent(),  # provider="openai-codex"
+        )
+        assert not captured.get("override_provider")
+        assert captured["routing_cfg"]["fallback_providers"] == [
+            {"provider": "anthropic", "model": "claude-sonnet-5"}
+        ]
     finally:
         unload()
 
@@ -1306,10 +1432,10 @@ def test_schema_prefers_direct_over_trivial_delegation_and_limits_astra():
     desc = plugin.ROUTE_TURN_SCHEMA["description"]
     assert "never delegate a question you can answer immediately" in desc
     assert "uncertain about RISK" in desc
-    assert "Astra at xhigh/max only for the most complex" in desc
-    assert "ambiguous multi-domain synthesis, architecture, long-context integration" in desc
+    assert "Astra) at xhigh/max is reserved for exceptional architecture" in desc
+    assert "extreme long-context integration, not routine work" in desc
     assert "Do not assign Astra when a lower model can safely complete the work" in desc
-    assert "Astra does not replace Sol's independent high-risk verification" in desc
+    assert "Astra does not replace Opus's independent critical verification" in desc
 
 
 def test_delegation_phase_contract_exposes_only_verifier_state():
