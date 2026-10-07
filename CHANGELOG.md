@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented here.
 
+## [0.5.0] - 2026-10-07
+
+### Removed
+
+- Remove the automatic high-risk verification stage. `route_turn` no longer accepts `worker_verifier`; the keyword classifiers that forced or forbade it are gone, and a worker completion no longer creates a forced verifier dispatch turn. Lanes no longer carry `phase`; a `phase` value sent by the model is ignored.
+- Remove the task-level development review gate: the `development_review` tool, `route_turn.review_task_id`, the repository fingerprint, the injected review guidance, and the `검토 대기` / `검토 중` / `검토 실패` prefixes on final answers.
+
+### Changed
+
+- Verification runs only when a user asks for it, as an ordinary `single` or `parallel` lane with `work_type=verification`. `fixed_models`, the model roster and the recovery chain are unchanged.
+- A delegation record left in `workers_dispatched` or `verifiers_dispatched` by an earlier version is claimed once as an ordinary completion. All completion records are now prunable by age. The `development_reviews` state key is left in place and ignored.
+- `delegation_phase_for_turn` always returns `worker`; `delegation_lifecycle_for_turn` no longer reports a `verification` mode.
+
+### Verification
+
+- Removed `tests/test_development_review.py` and `tests/test_risk_policy.py`; added regressions for the removed mode, ignored `phase`, wording that used to force verification, legacy-record claims and replay rejection. The core/registry/positional/JSON dispatch-and-completion contract test moved to `tests/test_routing.py` and now covers an ordinary `single` plan.
+- The tests that need no Hermes source pass off-host (104). The full `scripts/verify.sh` suite against the installed Hermes, the gateway restart and the Slack smoke test are pending.
+
 ## [0.4.0] - 2026-10-07
 
 ### Changed
