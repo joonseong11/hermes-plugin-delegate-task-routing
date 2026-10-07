@@ -58,15 +58,13 @@ def build_captured(monkeypatch, model, parent_agent, *, allowed=MODELS, **overri
     return captured
 
 
-def lane(work_type="implementation", model="claude-opus-5", phase="worker", label="work"):
-    return {"label": label, "phase": phase, "work_type": work_type, "model": model,
+def lane(work_type="implementation", model="claude-opus-5", label="work"):
+    return {"label": label, "work_type": work_type, "model": model,
             "reasoning_effort": "high", "toolsets": ["file"]}
 
 
 def validate(lanes, *, mode="single", **options):
     payload = {"mode": mode, "reason": "bounded work", "lanes": lanes}
-    if "review_task_id" in options:
-        payload["review_task_id"] = options.pop("review_task_id")
     return plugin._validate_plan(
         payload, allowed_models=MODELS, allowed_efforts=settings("allowed_reasoning_efforts"),
         allowed_toolsets=settings("allowed_toolsets"), **options,
@@ -102,54 +100,33 @@ def test_execution_and_research_fixed_model(work_type, model):
             validate([lane(work_type, model)])
 
 
-@pytest.mark.parametrize("phase", ["worker", "verifier"])
 @pytest.mark.parametrize("model", MODELS)
-def test_verification_model_including_worker_labeled_reviewers(phase, model):
-    args = {"review_task_id": "checkpoint"} if phase == "verifier" else {}
+def test_requested_verification_lane_uses_fixed_model(model):
     if model == "gpt-6.1-sol":
-        assert validate([lane("verification", model, phase)], **args)["lanes"][0]["model"] == model
+        assert validate([lane("verification", model)])["lanes"][0]["model"] == model
     else:
         with pytest.raises(ValueError, match="requires model=gpt-6.1-sol; use gpt-6.1-sol"):
-            validate([lane("verification", model, phase)], **args)
+            validate([lane("verification", model)])
 
 
-@pytest.mark.parametrize("work_type", ["implementation", "research", "mechanical", "architecture"])
-@pytest.mark.parametrize("review_phase", ["worker", "verifier"])
-def test_checkpoint_review_cannot_bypass_verification_by_relabeling(work_type, review_phase):
-    with pytest.raises(ValueError, match="requires work_type=verification and model=gpt-6.1-sol"):
-        validate([lane(work_type, "gpt-6.1-sol", review_phase)], review_task_id="checkpoint")
+def test_requested_verification_lane_uses_configured_model():
+    item = lane("verification", "claude-sonnet-5")
+    plan = validate([item], fixed_models={"verification": "claude-sonnet-5"})
+    assert plan["lanes"] == [item]
 
 
-@pytest.mark.parametrize("work_type", ["implementation", "research", "mechanical", "architecture"])
-def test_worker_verifier_verifier_requires_verification_type(work_type):
-    with pytest.raises(ValueError, match="work_type=verification"):
-        validate([lane(), lane(work_type, "gpt-6.1-sol", "verifier", "verify")], mode="worker_verifier")
+def test_worker_verifier_mode_is_removed():
+    lanes = [lane(), lane("verification", "gpt-6.1-sol", "verify")]
+    with pytest.raises(ValueError, match="mode must be direct, single, or parallel"):
+        validate(lanes, mode="worker_verifier")
+    assert validate(lanes, mode="parallel")["lanes"] == lanes
 
 
-@pytest.mark.parametrize("model", MODELS)
-def test_worker_verifier_verifier_model_fixed(model):
-    verifier = lane("verification", model, "verifier", "verify")
-    if model == "gpt-6.1-sol":
-        assert validate([lane(), verifier], mode="worker_verifier")["lanes"][1]["model"] == model
-    else:
-        with pytest.raises(ValueError, match="use gpt-6.1-sol"):
-            validate([lane(), verifier], mode="worker_verifier")
-
-
-@pytest.mark.parametrize("phase", ["worker", "verifier"])
-def test_checkpoint_uses_configured_verification_model_before_normalization(phase):
-    item = lane("verification", "claude-sonnet-5", phase)
-    plan = validate([item], review_task_id="checkpoint",
-                    fixed_models={"verification": "claude-sonnet-5"})
-    assert plan["lanes"][0] == {**item, "phase": "worker"}
-    assert item["phase"] == phase
-
-
-def test_worker_verifier_accepted_with_fixed_models():
-    worker = lane()
-    verifier = lane("verification", "gpt-6.1-sol", "verifier", "verify")
-    plan = validate([worker, verifier], mode="worker_verifier", require_worker_verifier=True)
-    assert plan["lanes"] == [worker, verifier] and plan["expected_lanes"] == [worker]
+def test_legacy_phase_field_is_ignored():
+    item = {**lane("verification", "gpt-6.1-sol"), "phase": "verifier"}
+    plan = validate([item])
+    assert plan["lanes"] == [lane("verification", "gpt-6.1-sol")]
+    assert "expected_lanes" not in plan and "stage" not in plan
 
 
 @pytest.mark.parametrize("work_type", ["mechanical", "architecture"])
@@ -204,12 +181,11 @@ def test_registered_route_uses_configuration_in_validator_and_guidance(monkeypat
         props = route["parameters"]["properties"]["lanes"]["items"]["properties"]
         assert props["model"]["enum"] == MODELS
         assert f"implementation: {fixed['implementation']}" in route["description"]
-        assert f"verification (including phase=verifier/checkpoint): {fixed['verification']}" in props["work_type"]["description"]
+        assert f"verification: {fixed['verification']}" in props["work_type"]["description"]
         for work_type, model in fixed.items():
             sid, tid = f"fixed-{work_type}", "fixed-turn"
             key = plugin._turn_key(sid, tid)
             monkeypatch.delitem(plugin._TURN_PLANS, key, raising=False)
-            monkeypatch.delitem(plugin._TURN_RISK_REQUIREMENTS, key, raising=False)
             payload = {"mode": "single", "reason": "policy test", "lanes": [lane(work_type, model)]}
             result = json.loads(ctx.tools["route_turn"](payload, session_id=sid, turn_id=tid))
             assert result["status"] == "accepted"
@@ -219,7 +195,7 @@ def test_registered_route_uses_configuration_in_validator_and_guidance(monkeypat
             assert plugin._turn_key(sid, "rejected-turn") not in plugin._TURN_PLANS
             p = parent()
             p.session_id, p._current_turn_id = sid, tid
-            task = {k: v for k, v in lane(work_type, model).items() if k not in {"phase", "work_type"}}
+            task = {k: v for k, v in lane(work_type, model).items() if k != "work_type"}
             task["goal"] = "test"
             assert plugin._validate_delegate_against_plan(p, [task])["lanes"][0]["work_type"] == work_type
             task["model"] = "gpt-6-astra"

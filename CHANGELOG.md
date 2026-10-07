@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented here.
 
+## [0.5.0] - 2026-10-07
+
+### Removed
+
+- Remove the automatic high-risk verification stage. `route_turn` no longer accepts `worker_verifier`; the keyword classifiers that forced or forbade it are gone, and a worker completion no longer creates a forced verifier dispatch turn. Lanes no longer carry `phase`; a `phase` value sent by the model is ignored.
+- Remove the task-level development review gate: the `development_review` tool, `route_turn.review_task_id`, the repository fingerprint, the injected review guidance, and the `검토 대기` / `검토 중` / `검토 실패` prefixes on final answers.
+
+### Changed
+
+- Verification runs only when a user asks for it, as an ordinary lane with `work_type=verification`. Work and a review of that work cannot run from one message: there is no sequential mode and a completion turn cannot dispatch further lanes, so the guidance tells the parent to delegate the work only and to say the review has not run; the user requests it in a follow-up message. `fixed_models`, the model roster and the recovery chain are unchanged.
+- A delegation record left in `workers_dispatched` or `verifiers_dispatched` by an earlier version is claimed once as an ordinary completion; a legacy verifier completion keeps the stored worker routes and source delegation in the header and lifecycle view. All completion records are now prunable by age. The `development_reviews` state key is left in place and ignored.
+- `delegation_phase_for_turn` always returns `worker`; `delegation_lifecycle_for_turn` no longer reports a `verification` mode.
+- Cap `delegate_task` forcing at three forced calls per accepted plan. A `single`/`parallel` plan that has still not dispatched (rejected tasks, or `list`/`steer`/`stop` calls) is no longer forced, so the parent can report the blocker in text or call `route_turn` again instead of repeating the call until the core `identical_call_streak_halt` guardrail ends the turn without an answer. The plan and the pre-tool gate stay in force; the rejection and gate messages say that forcing was released. `route_turn` forcing already had the same three-call limit. A final answer sent from a released, undispatched plan gets the header `위임 미실행` rather than the declared lanes marked `실행 중`.
+
+### Verification
+
+- Removed `tests/test_development_review.py` and `tests/test_risk_policy.py`; added regressions for the removed mode, ignored `phase`, wording that used to force verification, legacy-record claims and replay rejection. The core/registry/positional/JSON dispatch-and-completion contract test moved to `tests/test_routing.py` and now covers an ordinary `single` plan.
+- `scripts/verify.sh` passed in the gateway container against the installed Hermes from a separate checkout of this branch at `75bfe2a`: 189 tests and the installed private-symbol contract. The gateway restart and the Slack smoke test are pending.
+
 ## [0.4.0] - 2026-10-07
 
 ### Changed

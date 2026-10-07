@@ -1,6 +1,6 @@
 # delegate-task-routing
 
-Current release: `v0.4.0` (local working version, unpublished; gateway activation pending). See [COMPATIBILITY.md](COMPATIBILITY.md) before changing the Hermes version and [CHANGELOG.md](CHANGELOG.md) for release history.
+Current release: `v0.5.0` (gateway activation pending). See [COMPATIBILITY.md](COMPATIBILITY.md) before changing the Hermes version and [CHANGELOG.md](CHANGELOG.md) for release history.
 
 Persistent, in-process orchestration policy for Hermes. It forces a per-turn execution decision on Slack parent sessions, applies exact-allowlisted per-task routing, records requested versus actual child execution, and deterministically prepends the `_Alex: ..._` execution header.
 
@@ -10,36 +10,27 @@ Persistent, in-process orchestration policy for Hermes. It forces a per-turn exe
 
 Clear icon/color/copy/alignment/spacing/visibility edits use direct execution when they do not change shared component definitions, Variant/Property schemas, navigation contracts, or permissions. The parent reloads user-requested changed skills, preserves user changes, records each external write, and reads back and visually checks every changed screen. Repeating the same local change on several screens is not itself a reason to delegate.
 
-Routing remains the first tool call. A requested skill refresh selects direct with empty lanes before skill_view. If that read reveals higher-risk work, the parent reroutes before any write. Already-delegated work and completion/verifier turns retain their existing routing; this is not a general route-reset permission.
+Routing remains the first tool call. A requested skill refresh selects direct with empty lanes before skill_view. If that read reveals a larger scope, the parent reroutes before any write. Already-delegated work and completion turns retain their existing routing; this is not a general route-reset permission.
 
 This is model-facing classification guidance, not an automatic Figma risk classifier. Its effect must be checked in actual task traces. Changing these Python files does not hot-reload an already imported plugin; no gateway restart is performed as part of this file-only change.
 
 Every normal Slack parent turn must call `route_turn` first. LLM request middleware forces that exact tool choice until a valid decision exists:
 
 - `direct`: trivial lookup, brief judgment, bounded read-only checks, or small reversible local edits; no delegation lanes.
-- `single`: substantial general research/implementation in exactly one worker lane, including its own focused tests. Parent reviews evidence; a second verifier is not automatic.
+- `single`: substantial general research/implementation in exactly one worker lane, including its own focused tests. Parent reviews evidence.
 - `parallel`: at least two genuinely independent outcomes. Implementation and its dependent tests are not separate parallel outcomes.
-- `worker_verifier`: separate execution/review for external sends/posts/publishing/submission, production changes/deployments, money/accounting, legal/security/access work, irreversible effects or genuinely high-error-cost output. Changes to routing/verification policy itself belong here, even in a local file.
 
-### Task-level development review (v0.4.0)
+### No automatic verification (v0.5.0)
 
-For recognized reversible local code-development requests, `pre_llm_call` creates a profile-scoped task ID. This **does not** change the per-turn route: direct/single/parallel remain available for ordinary work; high-risk `worker_verifier` always takes precedence (including authentication/permissions, payments/refunds, routing policy, production DB, deployment and external writes). Register a git repository root with `development_review(action=begin, root=<absolute git top-level>)` after `route_turn`. A task retains `task_id`, phase, checkpoint fingerprint, reviewed fingerprint and trigger (`milestone` or `completion`) in profile-scoped plugin state. Work may continue with normal tools and focused tests. Responses, including `development_review(action=progress)` turns, retain their original body; a short Korean status line discloses pending or failed review without suppressing the conversation.
+The plugin never adds a verification or review stage on its own. Earlier versions forced a second verifier delegation when the request wording matched high-risk keywords (`worker_verifier`), and opened a repository-fingerprint review gate for requests that looked like development work (`development_review`). Both were removed in v0.5.0, together with the keyword classifiers that triggered them.
 
-At a meaningful milestone or before final readiness, call `development_review(action=checkpoint, task_id=..., trigger=milestone|completion)`. If the current revision is already reviewed, `ready` remains true without a repeat review. Otherwise call `route_turn(mode=single, review_task_id=..., lanes=[one reviewer])`, then `delegate_task` using that accepted lane contract. The patched native entrypoint supplies the read-only independent review goal and JSON output schema after the core dispatcher strips hidden fields, rechecking the artifact before launch. The parent may send an interim progress message while the child runs. The authenticated core async event must have `state=completed`, the same parent (or verified compression tip), one independent child, completed exit, a valid JSON object containing exactly `verdict`, `revision`, and string `findings`, `verdict=pass`, the frozen fingerprint, and an unchanged repository snapshot. `schema_valid=true` is expected; older results with `schema_valid=null` are accepted only if they satisfy the same exact JSON contract. Only then does `development_review(action=ready)` return ready for the exact artifact. A later edit or commit invalidates it; checkpoint again. Terminal malformed output or a failed verdict is recorded as `review_failed` with a reason, findings and a summary excerpt capped at 500 characters, not silently retried. Checkpoint explicitly for a new review. Failed or pending reviews cannot authorize completion. After reporting a reviewed task, `development_review(action=close)` ends its active lifecycle; this only succeeds for the reviewed revision. Closed tasks may still disclose later artifact changes.
+Verification is now requested by the person who needs it. When a user asks for an independent check or review, the parent routes it as an ordinary lane with `work_type=verification`, which still uses the fixed verification model. Nothing blocks or annotates a final answer for lack of a review.
 
-For this single checkpoint review, the lane's `phase` may be `worker` or `verifier`, but `work_type` must be `verification` and the model must be `gpt-6.1-sol` (or the configured fixed verification model); `verifier` is normalized to `worker` for dispatch. Without `review_task_id`, single mode still accepts worker lanes only, and checkpoint review never bypasses mandatory high-risk `worker_verifier`. Reviewer JSON may be markdown-fenced or surrounded by prose: extraction uses the same helper as the core output validator (with an equivalent local import fallback), then the extracted object must satisfy the exact review contract and both revision checks. Prose alone or schema-invalid objects do not grant readiness.
+A review can only cover work that already exists. The plugin has no sequential mode, and a completion turn cannot dispatch further lanes, so work and a review of that work cannot run from one message: the guidance tells the parent to delegate the work only and to say that the review has not run. The user asks for the review in a follow-up message once the work is back.
 
-Fingerprint scope is repository `HEAD` and all non-ignored tracked/untracked file contents, names, deletions and symlink targets. Ignored/generated files and external services are outside this gate. The development-intent classifier is a deterministic backstop, not semantic proof that every coding paraphrase was detected: explicitly call `begin` for a missed task. The final-output transform is **status presentation**, not a general re-entry or prose-suppression hook: core `agent/turn_finalizer.py` runs the first nonempty `transform_llm_output` on truthy, uninterrupted responses only, and another earlier transform or streaming preview may bypass this transform. Registration, review dispatch, exact-artifact readiness and core-ledger authentication are enforced at plugin tool/async boundaries. Do not represent the local tests as unconditional pre-delivery enforcement across all delivery paths.
+Records written by earlier versions are handled as follows. A delegation left in a `workers_dispatched` or `verifiers_dispatched` stage is accepted once as an ordinary completion; no verifier is dispatched for it. The `development_reviews` plugin-state key is no longer read or written.
 
-### Narrowed deterministic boundary (staged)
-
-Bare `운영`, `production`, and `prod` previously forced a verifier even in an operations/fast-mode explanation or production-log lookup. They now permit routine routing **only with a read/explanation cue and no mutation cue anywhere in the request**. Mixed read-and-write requests, including later clauses/newlines, retain worker+verifier. Ambiguous operational requests without a clear read-only cue remain forced-high; other unclassified requests retain the existing semantic decision (`None`) rather than forbidding conservative verification.
-
-All other high-risk keywords still take precedence over local/draft/test/read cues. This deliberately does not relax legal/security/accounting reviews or external writes, and it does not treat quoted/negated `deploy`, `publish`, etc. as safe. The classifier is a lexical backstop, not a complete intent parser: an unrecognized mutation paraphrase can escape detection, while a discussion containing mutation/risk terms can still over-escalate. The model must assess actual side effects and error cost; mode/count validation cannot prove that parallel outcomes are independent. No model roster, fallback/provider settings, fast mode, permission checks or verifier-continuation machinery changed.
-
-`tests/test_risk_policy.py` covers Korean operation discussion, read-only production checks, routine local implementation, mixed production writes, external messages/writes, legal/security/money, routing-policy edits and conservative ambiguity. These are local policy tests, not a measured live latency improvement. Gateway restart and fresh-session routing smoke tests remain pending.
-
-After a delegated decision, the next model call is forced to `delegate_task`. A `pre_tool_call` gate blocks unrelated tools between the decision and dispatch. Subagents and non-Slack runtimes are excluded from the parent-turn gate and from Alex headers.
+After a delegated decision, the next model call is forced to `delegate_task`. The forcing stops after three forced calls that dispatch nothing (rejected tasks, or `list`/`steer`/`stop` calls): the plan and the gate stay in place, but the parent may then report the blocker in text or call `route_turn` again. A final answer sent in that state carries the header `위임 미실행` instead of listing the declared lanes as running. A `pre_tool_call` gate blocks unrelated tools between the decision and dispatch. Subagents and non-Slack runtimes are excluded from the parent-turn gate and from Alex headers.
 
 ## Added task fields
 
@@ -64,7 +55,7 @@ restart-recovered `unknown`) so failed/timeout lanes render as failures rather
 than generic missing information. If a record is genuinely missing, pruned, or
 cannot be authenticated to the parent session, it is labeled `위임 기록 만료 · 실행경로 미검증`; attribution is never invented.
 
-`worker_verifier` is sequenced across two durable async delegations. The first dispatch contains worker lanes only. Its completion event creates a new policy turn that forces the declared verifier lanes, injects the worker result into that turn, and prevents final-completion reporting until the verifier delegation returns. The worker and verifier route records are then merged for the final header. The continuation record is stored through the profile-scoped plugin-state API so a gateway restart between stages does not silently collapse the plan.
+Each authenticated async completion is claimed once through the profile-scoped plugin-state API, so a replayed completion marker is rejected, also after a gateway restart, for as long as its record is retained. Records are pruned by age beyond 100 entries; a marker replayed after its record was pruned, or while the state read fails, is not recognized as a replay.
 
 ## Safety boundaries
 
@@ -119,13 +110,10 @@ Every `route_turn` lane requires `work_type` with an exact enum value:
 | --- | --- | --- |
 | `implementation` | `claude-opus-5` | Code changes, file/sheet/doc writing, Figma edits, deploy preparation, any local/external write |
 | `research` | `claude-opus-5` | Web research, DB query analysis, root-cause diagnosis, comparison/recommendation |
-| `verification` | `gpt-6.1-sol` | Independent checks; every verifier phase and checkpoint reviewer |
+| `verification` | `gpt-6.1-sol` | Independent checks and reviews a user asks for |
 | `mechanical` | Any allowlisted model | Extraction, reformatting, deterministic checks, simple visual QA |
 | `architecture` | Any allowlisted model | Exceptional architecture/design |
 
-Both a `phase=verifier` lane and a `review_task_id` lane require
-`work_type=verification`, including a checkpoint reviewer labeled `worker`.
-Checks run **before** normalizing a single checkpoint verifier to worker dispatch.
 A rejected route tells the model the required work type/model. The declared work
 type is a semantic contract, not automatic classification of arbitrary goals.
 Tasks need not carry `work_type`: matching remains label/model/effort/toolsets.
@@ -141,9 +129,8 @@ fixed_models:
   verification: gpt-6.1-sol
 ```
 
-This changes delegated lane models, not the parent model or risk policy. Trivial
-safe work stays direct; bounded work uses single; independent outcomes use parallel;
-consequential work retains worker_verifier with separate phases.
+This changes delegated lane models, not the parent model. Trivial safe work stays
+direct; bounded work uses single; independent outcomes use parallel.
 
 Recovery is one ordered chain. Each primary receives only the models **after** it:
 
