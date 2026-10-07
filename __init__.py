@@ -29,7 +29,7 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-PLUGIN_VERSION = "0.3.1"
+PLUGIN_VERSION = "0.3.2"
 PLUGIN_ID = "delegate-task-routing"
 _PATCH_MARKER = "_delegate_task_routing_plugin_v1"
 _ROUTE_FIELDS = ("label", "model", "reasoning_effort", "toolsets")
@@ -169,10 +169,24 @@ def _review_records() -> dict[str, dict[str, Any]]:
         raise RuntimeError("invalid development review state")
     return records
 
+_REVIEW_MAX_AGE_SECONDS = 72 * 60 * 60
+
+
+def _review_expired(task: Mapping[str, Any]) -> bool:
+    try:
+        return time.time() - float(task["created_at"]) > _REVIEW_MAX_AGE_SECONDS
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 def _save_review(task: dict[str, Any]) -> None:
     with _POLICY_LOCK:
         records = dict(_review_records())
         records[task["task_id"]] = task
+        for task_id, record in list(records.items()):
+            if isinstance(record, dict) and record.get("phase") != "closed" and _review_expired(record):
+                records[task_id] = {**record, "phase": "closed", "closed_reason": "stale",
+                                    "closed_at": time.time()}
         if len(records) > 100:
             closed = sorted((t for t in records.values() if isinstance(t, dict) and t.get("phase") == "closed"),
                             key=lambda t: t.get("created_at", 0))
@@ -180,14 +194,17 @@ def _save_review(task: dict[str, Any]) -> None:
                 records.pop(closed.pop(0)["task_id"], None)
         _PLUGIN_STATE.set("development_reviews", records)
 
+
 def _review_task(session_id: str, task_id: str = "") -> dict[str, Any] | None:
     with _POLICY_LOCK:
         records = _review_records()
         if task_id:
             task = records.get(task_id)
-            return dict(task) if isinstance(task, dict) and _owned_session(task.get("session_id", ""), session_id) else None
+            return (dict(task) if isinstance(task, dict) and not _review_expired(task)
+                    and _owned_session(task.get("session_id", ""), session_id) else None)
         candidates = [dict(t) for t in records.values() if isinstance(t, dict)
-                      and t.get("phase") != "closed" and _owned_session(t.get("session_id", ""), session_id)]
+                      and t.get("phase") != "closed" and not _review_expired(t)
+                      and _owned_session(t.get("session_id", ""), session_id)]
         return max(candidates, key=lambda t: t.get("created_at", 0)) if candidates else None
 
 def _artifact_revision(root: str) -> str:
@@ -913,6 +930,34 @@ def _install_patches(
                 policy_plan = _validate_delegate_against_plan(parent_agent, tasks)
             except (RuntimeError, ValueError) as exc:
                 return tool_error(str(exc))
+        if policy_plan is not None and policy_plan.get("review_task_id"):
+            # Core's live dispatcher already stripped model-hidden fields. Inject
+            # here, not in the registry handler which that dispatcher bypasses.
+            try:
+                if not isinstance(tasks, list) or len(tasks) != 1 or not isinstance(tasks[0], dict):
+                    return tool_error("development review requires exactly one reviewer task")
+                review_task = _review_task(str(getattr(parent_agent, "session_id", "") or ""), policy_plan["review_task_id"])
+                if (not review_task or not review_task.get("root")
+                        or _artifact_revision(review_task["root"]) != policy_plan["review_revision"]):
+                    return tool_error("review artifact changed before reviewer launch")
+                tasks = [dict(tasks[0])]
+                tasks[0]["goal"] = (
+                    "Independently inspect the repository at " + review_task["root"] +
+                    " and run appropriate read-only verification for the checkpoint. "
+                    "Report blocking findings; pass only if the artifact merits completion. "
+                    "The exact revision fingerprint is " + policy_plan["review_revision"] +
+                    '. Return only JSON {"verdict": "pass" or "fail", "revision": '
+                    'the exact fingerprint, "findings": a string}. '
+                    "Do not edit the artifact or perform external writes."
+                )
+                tasks[0]["output_schema"] = copy.deepcopy(_REVIEW_SCHEMA)
+                if len(args) >= 3:
+                    args = (*args[:2], tasks, *args[3:])
+                    kwargs.pop("tasks", None)
+                else:
+                    kwargs["tasks"] = tasks
+            except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+                return tool_error(str(exc))
         try:
             routes = _validate_routes(
                 tasks,
@@ -1326,52 +1371,66 @@ def _mark_completion_consumed(delegation_id: str, stage: str) -> None:
 
 
 def _review_completion(delegation_id: str, session_id: str) -> bool:
-    """Only a core-owned terminal child verdict for the exact frozen revision counts."""
+    """Authenticate a terminal review; malformed output fails visibly, not in a loop."""
     with _POLICY_LOCK:
         matches = [dict(t) for t in _review_records().values() if isinstance(t, dict)
                    and t.get("delegation_id") == delegation_id
-                   and t.get("phase") == "review_pending"
+                   and t.get("phase") == "review_pending" and not _review_expired(t)
                    and _owned_session(t.get("session_id", ""), session_id)]
         if len(matches) != 1:
             return False
         task = matches[0]
-        # Use the core's ledger reader: immutable SQLite omits uncheckpointed
-        # WAL frames, so a just-finished child may be invisible to it. The
-        # plugin-owned dispatch binding above authenticates this id and owner;
-        # the core reader authenticates terminal status and the child result.
+        # The core reader includes uncheckpointed WAL frames; the plugin-owned
+        # dispatch binding above authenticates this id and owner.
         from tools.async_delegation import get_durable_delegation
         core = get_durable_delegation(delegation_id)
-        if not core or core.get("delegation_id") != delegation_id or core.get("state") != "completed":
+        if (not core or core.get("delegation_id") != delegation_id
+                or core.get("state") not in {"completed", "error", "unknown"}):
             return False
         result_data = core.get("result") or {}
         results = result_data.get("results") if isinstance(result_data, dict) else []
-        results = results or []
-        if (len(results) != 1 or results[0].get("status") != "completed"
-                or results[0].get("exit_reason") != "completed"
-                or results[0].get("schema_valid") is not True):
-            task.update(phase="review_due", delegation_id=None)
+        result = results[0] if isinstance(results, list) and len(results) == 1 and isinstance(results[0], dict) else {}
+        summary = str(result.get("summary") or "")
+
+        def failed(reason: str, findings: str = "") -> bool:
+            task.update(phase="review_failed", review_failure_reason=reason,
+                        reviewer_summary=summary[:500], findings=findings or reason,
+                        reviewed_revision=None)
             _save_review(task)
             return False
-        result = results[0]
+
+        if (core.get("state") != "completed" or not result
+                or result.get("status") != "completed" or result.get("exit_reason") != "completed"):
+            return failed("검토가 정상적으로 끝나지 않았습니다")
         routing = result.get("routing") or {}
-        if (not routing.get("child_session_id") or
-                routing.get("child_session_id") == task["session_id"] or
-                routing.get("extension") != f"{PLUGIN_ID}@{PLUGIN_VERSION}"):
-            return False
+        if (not isinstance(routing, dict) or not routing.get("child_session_id")
+                or routing.get("child_session_id") == task["session_id"]
+                or routing.get("extension") != f"{PLUGIN_ID}@{PLUGIN_VERSION}"):
+            return failed("독립 검토 결과를 확인할 수 없습니다")
+        # Core already made its one bounded schema retry. Do not redispatch
+        # silently. Older schema-less results may pass only this exact contract.
+        if result.get("schema_valid") is not True and result.get("schema_valid") is not None:
+            return failed("검토 결과 형식이 올바르지 않습니다")
         try:
-            verdict = json.loads(str(result.get("summary") or ""))
+            verdict = json.loads(summary)
         except (ValueError, TypeError):
-            verdict = {}
-        if (isinstance(verdict, dict) and verdict.get("verdict") == "pass"
-                and verdict.get("revision") == task["revision"]
-                and _artifact_revision(task["root"]) == task["revision"]):
-            task.update(phase="reviewed", reviewed_revision=task["revision"],
-                        reviewed_delegation_id=delegation_id)
-            _save_review(task)
-            return True
-        task.update(phase="review_due", delegation_id=None, reviewed_revision=None)
+            return failed("검토 결과를 읽을 수 없습니다")
+        if (not isinstance(verdict, dict) or set(verdict) != set(_REVIEW_SCHEMA["required"])
+                or not all(isinstance(verdict.get(key), str) for key in _REVIEW_SCHEMA["required"])
+                or verdict.get("verdict") not in {"pass", "fail"}):
+            return failed("검토 결과 형식이 올바르지 않습니다")
+        if verdict["revision"] != task["revision"]:
+            return failed("검토 대상이 현재 작업과 다릅니다", verdict["findings"])
+        if _artifact_revision(task["root"]) != task["revision"]:
+            return failed("검토 중 작업 내용이 변경되었습니다", verdict["findings"])
+        if verdict["verdict"] == "fail":
+            return failed("검토에서 수정할 문제가 발견되었습니다", verdict["findings"])
+        task.update(phase="reviewed", reviewed_revision=task["revision"],
+                    reviewed_delegation_id=delegation_id, findings=verdict["findings"],
+                    reviewer_summary=summary[:500])
+        task.pop("review_failure_reason", None)
         _save_review(task)
-        return False
+        return True
 
 def _compression_tip(con: sqlite3.Connection, session_id: str) -> str:
     """Return only the verified compression-continuation tip."""
@@ -2073,23 +2132,31 @@ def _transform_header(response_text: str, session_id: str, model: str, **kwargs:
             if task is None:
                 with _POLICY_LOCK:
                     closed = [dict(t) for t in _review_records().values() if isinstance(t, dict)
-                              and t.get("phase") == "closed"
+                              and t.get("phase") == "closed" and not _review_expired(t)
                               and _owned_session(t.get("session_id", ""), session_id)]
                     task = max(closed, key=lambda t: t.get("created_at", 0)) if closed else None
             if task and not _review_status(task)["ready"]:
-                key = _turn_key(session_id, turn_id)
                 with _POLICY_LOCK:
-                    progress = key in _PROGRESS_TURNS
-                    _PROGRESS_TURNS.discard(key)
-                body = (
-                    "독립검토 전 진행 상황: 작업이 계속 진행 중입니다. 최종 완료 판정은 아직 없습니다."
-                    if progress else
-                    "완료 보류: 현재 작업 산출물의 독립검토가 끝나지 않았거나 검토 후 변경되었습니다. "
-                    "development_review checkpoint 및 독립 reviewer 결과가 필요합니다."
-                )
+                    _PROGRESS_TURNS.discard(_turn_key(session_id, turn_id))
+                phase = task.get("phase")
+                if phase == "review_pending":
+                    status = "검토 중: 결과를 기다리고 있습니다."
+                elif phase == "review_failed":
+                    reason = " ".join(str(task.get("review_failure_reason") or "결과를 확인할 수 없습니다").split())[:120]
+                    status = f"검토 실패: {reason}. 재검토 필요."
+                elif phase == "review_due":
+                    status = "검토 대기: 작업 확인을 마쳤고 검토를 기다리고 있습니다."
+                elif phase in {"reviewed", "closed"}:
+                    status = "검토 대기: 작업 내용이 바뀌어 재검토가 필요합니다."
+                else:
+                    status = "검토 대기: 작업이 진행 중입니다."
+                if not body.startswith(status + "\n\n"):
+                    body = f"{status}\n\n{body}"
         except Exception as exc:
             _LOG.error("Cannot verify development review readiness: %s", exc)
-            body = "완료 보류: 개발 작업의 검토 상태를 검증할 수 없습니다."
+            status = "검토 실패: 검토 상태를 확인할 수 없습니다. 재검토 필요."
+            if not body.startswith(status + "\n\n"):
+                body = f"{status}\n\n{body}"
     return f"{header}\n\n{body}"
 
 
@@ -2248,7 +2315,6 @@ def register(ctx) -> None:
             action = str(args.get("action") or "").strip().lower()
             parent_agent = kw.get("parent_agent")
             tasks = delegate_module._strip_model_hidden_task_fields(args.get("tasks"))
-            plan = None
             enforce_plan = (
                 parent_agent is not None
                 and getattr(parent_agent, "_delegate_depth", 0) == 0
@@ -2257,26 +2323,14 @@ def register(ctx) -> None:
             )
             if action not in {"list", "steer", "stop"} and enforce_plan:
                 try:
-                    plan = _validate_delegate_against_plan(parent_agent, tasks)
+                    _validate_delegate_against_plan(parent_agent, tasks)
                 except (RuntimeError, ValueError) as exc:
                     from tools.registry import tool_error
 
                     return tool_error(str(exc))
-            if plan is not None and plan.get("review_task_id"):
-                review_task = _review_task(str(getattr(parent_agent, "session_id", "") or ""), plan["review_task_id"])
-                if not review_task or _artifact_revision(review_task["root"]) != plan["review_revision"]:
-                    from tools.registry import tool_error
-                    return tool_error("review artifact changed before reviewer launch")
-                tasks = [dict(tasks[0])]
-                tasks[0]["goal"] = (
-                    "Independently inspect the repository at " + review_task["root"] +
-                    " and run appropriate verification for the checkpoint. "
-                    "Report blocking findings; pass only if the artifact merits completion. "
-                    "The exact revision fingerprint is " + plan["review_revision"] +
-                    ". Return JSON verdict, revision, findings. Do not edit the artifact."
-                )
-                tasks[0]["output_schema"] = _REVIEW_SCHEMA
-            result = delegate_module.delegate_task(
+            # Injection and dispatch bookkeeping belong to the patched core
+            # entrypoint; both registry and live-dispatch calls use it.
+            return delegate_module.delegate_task(
                 goal=args.get("goal"),
                 context=args.get("context"),
                 tasks=tasks,
@@ -2291,16 +2345,6 @@ def register(ctx) -> None:
                 message=args.get("message"),
                 parent_agent=parent_agent,
             )
-            if plan is not None:
-                try:
-                    parsed_result = json.loads(result) if isinstance(result, str) else result
-                except (TypeError, json.JSONDecodeError):
-                    parsed_result = {}
-                if isinstance(parsed_result, Mapping):
-                    with _POLICY_LOCK:
-                        _mark_delegation_dispatch(plan, parsed_result)
-                return result
-            return result
 
         route_registration = ctx.register_tool(
             name="route_turn",

@@ -65,16 +65,17 @@ def ledger(tmp_path, delegation_id, event, *, owner="owner", state="completed"):
         con.execute("INSERT INTO async_delegations VALUES (?,?,?,?)", (delegation_id, state, owner, json.dumps(event)))
 
 
-def test_progress_and_forged_final_blocked_without_message_matching(registered_plugin, tmp_path):
+def test_progress_and_final_body_preserved_without_message_matching(registered_plugin, tmp_path):
     ctx = registered_plugin
     root = repo(tmp_path)
     task_id = active(ctx, root)
     assert task_id
     before = plugin._transform_header("DONE all tests passed", "owner", "gpt-6.1-sol", turn_id="turn-1")
-    assert "완료 보류" in before and "DONE all tests passed" not in before
+    assert "검토 대기" in before and before.endswith("DONE all tests passed")
     invoke(ctx, "owner", "turn-1", "progress", task_id=task_id)
     progress = plugin._transform_header("Production ready, no review needed", "owner", "gpt-6.1-sol", turn_id="turn-1")
-    assert "진행 상황" in progress and "Production ready" not in progress
+    assert "검토 대기" in progress and progress.endswith("Production ready, no review needed")
+    assert progress.count("검토 대기:") == 1
     assert invoke(ctx, "other", "turn-2", "ready", task_id=task_id).get("error")
 
 
@@ -102,7 +103,7 @@ def test_checkpoint_dedup_invalidation_and_exact_readiness(registered_plugin, tm
     assert invoke(ctx, "owner", "turn-1", "checkpoint", task_id=task_id)["phase"] == "closed"
     assert plugin._review_task("owner") is None
     (root / "artifact.txt").write_text("second change\n")
-    assert "완료 보류" in plugin._transform_header("final ready", "owner", "gpt-6.1-sol", turn_id="turn-1")
+    assert "검토 대기" in plugin._transform_header("final ready", "owner", "gpt-6.1-sol", turn_id="turn-1")
     assert invoke(ctx, "owner", "turn-1", "ready", task_id=task_id).get("error")
     next_task = invoke(ctx, "owner", "turn-1", "begin", root=str(root))["task_id"]
     assert next_task != task_id
@@ -201,7 +202,7 @@ def test_risk_precedence_and_auto_task_gate(registered_plugin, tmp_path):
     plugin._pre_llm_policy(user_message="Implement local parser code and tests", **context)
     task = plugin._review_task("auto-owner")
     assert task and task["root"] is None
-    assert "완료 보류" in plugin._transform_header("finished", "auto-owner", "gpt-6.1-sol", turn_id="turn")
+    assert "검토 대기" in plugin._transform_header("finished", "auto-owner", "gpt-6.1-sol", turn_id="turn")
     plugin._pre_llm_policy(user_message="Implement local parser code and deploy to production", session_id="risk-owner",
                            turn_id="risk-turn", platform="slack", task_id="parent")
     assert plugin._TURN_RISK_REQUIREMENTS[plugin._turn_key("risk-owner", "risk-turn")] is True
@@ -210,11 +211,41 @@ def test_risk_precedence_and_auto_task_gate(registered_plugin, tmp_path):
     assert invoke(ctx, "auto-owner", "turn", "close", task_id=task["task_id"]).get("error")
 
 
-def test_route_dispatch_and_async_completion_contract(registered_plugin, tmp_path, monkeypatch):
+@pytest.fixture
+def captured_core_entrypoint(monkeypatch):
+    """Install over a captured native original, never replace the patched entrypoint."""
+    import functools
+    import tools.delegate_tool as native
+    from tools.delegate_tool_tasks import _coerce_task_schemas
+    from test_routing import FakeCtx
+
+    captured = {}
+    original = native.delegate_task
+
+    @functools.wraps(original)
+    def core_original(*args, **kwargs):
+        tasks = kwargs.get("tasks", args[2] if len(args) >= 3 else None)
+        captured.update(tasks=copy.deepcopy(tasks))
+        schemas, error = _coerce_task_schemas(tasks, None)
+        assert error is None
+        captured["schemas"] = schemas
+        return json.dumps({"delegation_id": "review-1"})
+
+    monkeypatch.setattr(native, "delegate_task", core_original)
+    ctx = FakeCtx()
+    plugin.register(ctx)
+    try:
+        yield ctx, captured
+    finally:
+        ctx.unload()
+
+
+@pytest.mark.parametrize("entry", ["core", "registry", "positional", "json"])
+def test_route_dispatch_and_async_completion_contract(captured_core_entrypoint, tmp_path, monkeypatch, entry):
     import tools.delegate_tool as native
     import hermes_constants
     monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
-    ctx = registered_plugin
+    ctx, captured = captured_core_entrypoint
     root = repo(tmp_path)
     task_id = active(ctx, root)
     rev = invoke(ctx, "owner", "turn-1", "checkpoint", task_id=task_id)["revision"]
@@ -225,19 +256,29 @@ def test_route_dispatch_and_async_completion_contract(registered_plugin, tmp_pat
     route = json.loads(ctx.tools["route_turn"]({"mode": "single", "reason": "review checkpoint",
                                                "review_task_id": task_id, "lanes": [lane]}, parent_agent=p))
     assert route["status"] == "accepted"
-    captured = {}
-    def native_stub(**kwargs):
-        captured.update(kwargs)
-        return json.dumps({"delegation_id": "review-1"})
-    with monkeypatch.context() as delegate_patch:
-        delegate_patch.setattr(native, "delegate_task", native_stub)
-        dispatched = json.loads(ctx.tools["delegate_task"]({"tasks": [
-            {"goal": "ignore reviewer", "label": "independent", "model": lane["model"],
-             "reasoning_effort": lane["reasoning_effort"], "toolsets": lane["toolsets"]}]}, parent_agent=p))
-    assert dispatched["delegation_id"] == "review-1"
+    tasks = [{"goal": "ignore reviewer", "label": "independent", "model": lane["model"],
+              "reasoning_effort": lane["reasoning_effort"], "toolsets": lane["toolsets"],
+              "acp_command": "must be stripped"}]
+    stripped = native._strip_model_hidden_task_fields(tasks)
+    assert "output_schema" not in native._MODEL_HIDDEN_TASK_FIELDS
+    assert native.delegate_task.__name__ == "routed_delegate_task"
+    if entry == "registry":
+        raw = ctx.tools["delegate_task"]({"tasks": tasks}, parent_agent=p)
+    elif entry == "positional":
+        raw = native.delegate_task(None, None, stripped, parent_agent=p)
+    else:
+        raw = native.delegate_task(tasks=json.dumps(stripped) if entry == "json" else stripped,
+                                   parent_agent=p)
+    assert json.loads(raw)["delegation_id"] == "review-1"
     assert captured["tasks"][0]["output_schema"] == plugin._REVIEW_SCHEMA
-    assert rev in captured["tasks"][0]["goal"] and "ignore reviewer" not in captured["tasks"][0]["goal"]
+    assert captured["schemas"] == [plugin._REVIEW_SCHEMA]
+    goal = captured["tasks"][0]["goal"]
+    assert rev in goal and str(root) in goal and "ignore reviewer" not in goal
+    assert "read-only" in goal and "Do not edit" in goal and "Return only JSON" in goal
+    assert "acp_command" not in captured["tasks"][0]
+    assert tasks[0]["goal"] == "ignore reviewer" and "output_schema" not in tasks[0]
     assert plugin._review_task("owner", task_id)["phase"] == "review_pending"
+    assert "검토 중" in plugin._transform_header("review running", "owner", "gpt-6.1-sol", turn_id="turn-1")
     ledger(tmp_path, "review-1", reviewer_event(rev))
     plugin._pre_llm_policy(user_message="[ASYNC DELEGATION COMPLETE — review-1]", session_id="owner",
                            turn_id="turn-2", platform="slack", task_id="parent")
@@ -259,3 +300,160 @@ def test_read_only_code_discussion_does_not_create_dev_task(registered_plugin):
     plugin._pre_llm_policy(user_message="Explain this code without changing it", session_id="read-only-dev",
                            turn_id="turn", platform="slack", task_id="parent")
     assert plugin._review_task("read-only-dev") is None
+
+
+@pytest.mark.parametrize("kind", ["schema", "prose", "invalid_object", "fail"])
+def test_review_failure_is_recorded_and_body_is_preserved(registered_plugin, tmp_path, kind):
+    ctx = registered_plugin
+    root = repo(tmp_path)
+    task_id = active(ctx, root)
+    revision = invoke(ctx, "owner", "turn-1", "checkpoint", task_id=task_id)["revision"]
+    task = plugin._review_task("owner", task_id)
+    task.update(phase="review_pending", delegation_id="review-1")
+    plugin._save_review(task)
+    event = reviewer_event(revision)
+    result = event["results"][0]
+    if kind == "schema":
+        result["schema_valid"] = False
+    elif kind == "prose":
+        result.update(schema_valid=None, summary="검토 결과입니다. " * 100)
+    elif kind == "invalid_object":
+        result["summary"] = "[]"
+    else:
+        result["summary"] = json.dumps({"verdict": "fail", "revision": revision,
+                                        "findings": "Missing regression coverage"})
+    ledger(tmp_path, "review-1", event)
+    assert plugin._review_completion("review-1", "owner") is False
+    failed = plugin._review_task("owner", task_id)
+    assert failed["phase"] == "review_failed"
+    assert failed["review_failure_reason"] and failed["findings"]
+    assert failed["reviewer_summary"] == result["summary"][:500]
+    assert len(failed["reviewer_summary"]) <= 500
+    assert failed["delegation_id"] == "review-1"  # audit binding, not an automatic retry
+    if kind == "fail":
+        assert failed["findings"] == "Missing regression coverage"
+    body = "현재까지 확인한 내용\n\n- 사용자에게 전달할 상세 내용"
+    response = plugin._transform_header(body, "owner", "gpt-6.1-sol", turn_id="turn-1")
+    assert response.startswith("_Alex:") and response.endswith(body)
+    assert response.count("검토 실패:") == 1 and "재검토 필요" in response
+    assert failed["review_failure_reason"] in response
+    assert plugin._transform_header(response, "owner", "gpt-6.1-sol", turn_id="turn-1") == response
+    assert invoke(ctx, "owner", "turn-1", "ready", task_id=task_id).get("error")
+    assert plugin._review_completion("review-1", "owner") is False
+    assert invoke(ctx, "owner", "turn-1", "checkpoint", task_id=task_id)["phase"] == "review_due"
+
+
+@pytest.mark.parametrize("change", [None, "wrong_revision", "missing_findings", "extra_key", "wrong_type", "bad_verdict"])
+def test_schema_less_json_requires_exact_valid_contract(registered_plugin, tmp_path, change):
+    ctx = registered_plugin
+    root = repo(tmp_path)
+    task_id = active(ctx, root)
+    revision = invoke(ctx, "owner", "turn-1", "checkpoint", task_id=task_id)["revision"]
+    task = plugin._review_task("owner", task_id)
+    task.update(phase="review_pending", delegation_id="review-1")
+    plugin._save_review(task)
+    event = reviewer_event(revision, schema_valid=None)
+    verdict = json.loads(event["results"][0]["summary"])
+    if change == "wrong_revision": verdict["revision"] = "other"
+    if change == "missing_findings": verdict.pop("findings")
+    if change == "extra_key": verdict["unexpected"] = "no"
+    if change == "wrong_type": verdict["findings"] = []
+    if change == "bad_verdict": verdict["verdict"] = "approved"
+    event["results"][0]["summary"] = json.dumps(verdict)
+    ledger(tmp_path, "review-1", event)
+    assert plugin._review_completion("review-1", "owner") is (change is None)
+    task = plugin._review_task("owner", task_id)
+    assert task["phase"] == ("reviewed" if change is None else "review_failed")
+    assert plugin._review_status(task)["ready"] is (change is None)
+
+
+@pytest.mark.parametrize("phase, label", [("review_due", "검토 대기"), ("review_pending", "검토 중")])
+def test_review_status_prepend_on_progress_turn(registered_plugin, tmp_path, phase, label):
+    ctx = registered_plugin
+    root = repo(tmp_path)
+    task_id = active(ctx, root)
+    invoke(ctx, "owner", "turn-1", "checkpoint", task_id=task_id)
+    task = plugin._review_task("owner", task_id)
+    task["phase"] = phase
+    plugin._save_review(task)
+    invoke(ctx, "owner", "turn-1", "progress", task_id=task_id)
+    body = "수정한 파일과 테스트 결과는 다음과 같습니다.\n상세 결과"
+    response = plugin._transform_header(body, "owner", "gpt-6.1-sol", turn_id="turn-1")
+    assert response.endswith(body) and response.count(label + ":") == 1
+    assert response.split("\n\n")[1].startswith(label)
+
+
+@pytest.mark.parametrize("where", ["lookup", "readiness"])
+def test_readiness_exception_preserves_body(registered_plugin, tmp_path, monkeypatch, where):
+    root = repo(tmp_path)
+    active(registered_plugin, root)
+    def broken(*args, **kwargs):
+        raise RuntimeError("cannot read review")
+    monkeypatch.setattr(plugin, "_review_task" if where == "lookup" else "_review_status", broken)
+    response = plugin._transform_header("원래 응답 내용", "owner", "gpt-6.1-sol", turn_id="turn-1")
+    assert response.endswith("원래 응답 내용") and response.count("검토 실패:") == 1
+    assert "재검토 필요" in response
+
+
+@pytest.mark.parametrize("phase", ["working", "review_due", "review_pending", "review_failed", "reviewed"])
+def test_stale_review_ignored_then_auto_closed_on_next_save(registered_plugin, tmp_path, monkeypatch, phase):
+    ctx = registered_plugin
+    root = repo(tmp_path)
+    task_id = active(ctx, root)
+    now = plugin.time.time()
+    task = plugin._review_task("owner", task_id)
+    task.update(phase=phase, created_at=now - plugin._REVIEW_MAX_AGE_SECONDS - 1)
+    ctx.state.data["development_reviews"][task_id] = copy.deepcopy(task)
+    ctx.state.data["delegations"] = {"untouched": {"stage": "workers_dispatched"}}
+    monkeypatch.setattr(plugin.time, "time", lambda: now)
+    # Neither implicit nor explicit lookups, nor headers, inspect expired roots.
+    assert plugin._review_task("owner") is None
+    assert plugin._review_task("owner", task_id) is None
+    def no_snapshot(*args):
+        raise AssertionError("expired artifact must not be read")
+    with monkeypatch.context() as scoped:
+        scoped.setattr(plugin, "_artifact_revision", no_snapshot)
+        response = plugin._transform_header("원래 내용", "owner", "gpt-6.1-sol", turn_id="turn-1")
+        assert response.endswith("원래 내용") and "검토 대기" not in response
+    assert ctx.state.data["development_reviews"][task_id]["phase"] == phase  # read has no write side effect
+    fresh_id = invoke(ctx, "owner", "turn-1", "begin", root=str(root))["task_id"]
+    assert fresh_id != task_id
+    closed = ctx.state.data["development_reviews"][task_id]
+    assert closed == {**task, "phase": "closed", "closed_reason": "stale", "closed_at": now}
+    assert ctx.state.data["delegations"] == {"untouched": {"stage": "workers_dispatched"}}
+    # Closed stale records must not re-enter the header via its closed-task fallback.
+    fresh = plugin._review_task("owner", fresh_id)
+    fresh.update(session_id="another-owner")
+    plugin._save_review(fresh)
+    response = plugin._transform_header("새 응답", "owner", "gpt-6.1-sol", turn_id="turn-1")
+    assert response.endswith("새 응답") and "검토 대기" not in response
+
+
+def test_review_expiry_boundary(registered_plugin, tmp_path, monkeypatch):
+    task_id = active(registered_plugin, repo(tmp_path))
+    created = plugin._review_task("owner", task_id)["created_at"]
+    monkeypatch.setattr(plugin.time, "time", lambda: created + plugin._REVIEW_MAX_AGE_SECONDS)
+    assert plugin._review_task("owner", task_id) is not None
+    monkeypatch.setattr(plugin.time, "time", lambda: created + plugin._REVIEW_MAX_AGE_SECONDS + 1)
+    assert plugin._review_task("owner", task_id) is None
+
+
+def test_core_review_rechecks_revision_before_launch(captured_core_entrypoint, tmp_path):
+    import tools.delegate_tool as native
+    ctx, captured = captured_core_entrypoint
+    root = repo(tmp_path)
+    task_id = active(ctx, root)
+    invoke(ctx, "owner", "turn-1", "checkpoint", task_id=task_id)
+    p = parent()
+    p.session_id, p._current_turn_id, p.platform, p._delegate_depth = "owner", "turn-1", "slack", 0
+    lane = {"label": "independent", "phase": "worker", "model": "gpt-6.1-sol",
+            "reasoning_effort": "high", "toolsets": ["file"]}
+    route = json.loads(ctx.tools["route_turn"]({"mode": "single", "reason": "review checkpoint",
+                                               "review_task_id": task_id, "lanes": [lane]}, parent_agent=p))
+    assert route["status"] == "accepted"
+    (root / "artifact.txt").write_text("changed after route acceptance\n")
+    task = {key: value for key, value in lane.items() if key != "phase"}
+    task["goal"] = "review artifact"
+    result = json.loads(native.delegate_task(tasks=[task], parent_agent=p))
+    assert "review artifact changed before reviewer launch" in result["error"]
+    assert captured == {} and plugin._review_task("owner", task_id)["phase"] == "review_due"
