@@ -17,15 +17,18 @@ def one(pattern, text, label):
     return match.group(1)
 
 def changelog_version(text):
-    # `## [Unreleased]` may sit on top while a release branch is open; a tag must not have it.
-    heads = re.findall(r'^## \[([^]]+)\]', text, re.MULTILINE)
-    if heads and heads[0].lower() == "unreleased":
-        if os.environ.get("GITHUB_REF_TYPE", "") == "tag":
-            raise SystemExit("CHANGELOG.md still has an Unreleased section on a tagged release")
+    # `## [Unreleased]` may sit on top while a release branch is open; main and tags must not have it.
+    heads = re.findall(r'^## \[[^]]+\].*$', text, re.MULTILINE)
+    if heads and heads[0].lower().startswith("## [unreleased]"):
+        if os.environ.get("GITHUB_REF_TYPE", "") == "tag" or os.environ.get("GITHUB_REF_NAME", "") == "main":
+            raise SystemExit("CHANGELOG.md still has an Unreleased section on main or on a tag")
         heads = heads[1:]
     if not heads:
         raise SystemExit("missing CHANGELOG release")
-    return heads[0]
+    match = re.fullmatch(r'## \[(\d+\.\d+\.\d+)\] - \d{4}-\d{2}-\d{2}', heads[0].rstrip())
+    if not match:
+        raise SystemExit(f"topmost CHANGELOG release heading is not `## [X.Y.Z] - YYYY-MM-DD`: {heads[0]}")
+    return match.group(1)
 
 values = {
     "code": one(r'^PLUGIN_VERSION = "([^"]+)"$', code, "PLUGIN_VERSION"),
