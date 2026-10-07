@@ -29,7 +29,29 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-PLUGIN_VERSION = "0.3.2"
+try:
+    from tools.delegation_output_schema import extract_json_candidate
+except ImportError:
+    def extract_json_candidate(text: str) -> str:
+        """Strip markdown fences and prose around the outermost ``{...}``/``[...]``."""
+        raw = (text or "").strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1]
+            if raw.rstrip().endswith("```"):
+                raw = raw.rstrip()[: -3]
+            raw = raw.strip()
+            if raw.lower().startswith("json\n"):
+                raw = raw.split("\n", 1)[1]
+        for opener, closer in (("{", "}"), ("[", "]")):
+            if raw.startswith(opener):
+                return raw
+            start = raw.find(opener)
+            end = raw.rfind(closer)
+            if start >= 0 and end > start:
+                return raw[start : end + 1]
+        return raw
+
+PLUGIN_VERSION = "0.3.3"
 PLUGIN_ID = "delegate-task-routing"
 _PATCH_MARKER = "_delegate_task_routing_plugin_v1"
 _ROUTE_FIELDS = ("label", "model", "reasoning_effort", "toolsets")
@@ -387,7 +409,8 @@ ROUTE_TURN_SCHEMA = {
         "For a recognized reversible development task, use development_review "
         "to begin a repository-scoped task and checkpoint only at meaningful "
         "milestones or completion; use review_task_id with a single independent "
-        "reviewer after checkpoint. Do not repeat review for an unchanged revision. "
+        "reviewer lane labeled worker or verifier after checkpoint. "
+        "Do not repeat review for an unchanged revision. "
         "This task-level gate never substitutes for mandatory high-risk "
         "worker_verifier routing. "
         "Ordinary local analysis, research, "
@@ -445,7 +468,7 @@ ROUTE_TURN_SCHEMA = {
                 "enum": ["direct", "single", "parallel", "worker_verifier"],
             },
             "reason": {"type": "string", "minLength": 1},
-            "review_task_id": {"type": "string", "description": "Only for a single independent development checkpoint reviewer; copy the ID from development_review checkpoint."},
+            "review_task_id": {"type": "string", "description": "Only for a single independent development checkpoint reviewer; the lane may be labeled worker or verifier. Copy the ID from development_review checkpoint."},
             "lanes": {
                 "type": "array",
                 "description": "Worker/verifier lanes. MUST be [] when mode=direct.",
@@ -1154,6 +1177,10 @@ def _validate_plan(
         toolsets = _as_string_list(lane["toolsets"], setting=f"lanes[{index}].toolsets")
         if phase not in {"worker", "verifier"}:
             raise ValueError(f"lane {index} phase must be worker or verifier")
+        # A checkpoint reviewer is a single dispatch lane, not the second stage
+        # of high-risk worker_verifier. Preserve downstream worker semantics.
+        if mode == "single" and payload.get("review_task_id") and phase == "verifier":
+            phase = "worker"
         if model not in set(allowed_models):
             raise ValueError(f"lane {index} model is not allowed")
         if effort not in set(allowed_efforts):
@@ -1398,7 +1425,7 @@ def _review_completion(delegation_id: str, session_id: str) -> bool:
         if result.get("schema_valid") is not True and result.get("schema_valid") is not None:
             return failed("검토 결과 형식이 올바르지 않습니다")
         try:
-            verdict = json.loads(summary)
+            verdict = json.loads(extract_json_candidate(summary))
         except (ValueError, TypeError):
             return failed("검토 결과를 읽을 수 없습니다")
         if (not isinstance(verdict, dict) or set(verdict) != set(_REVIEW_SCHEMA["required"])

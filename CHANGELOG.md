@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.3] - 2026-10-07
+
+### Fixed
+
+- Parse reviewer summaries through Hermes' `extract_json_candidate`, with an identical local fallback when the helper cannot be imported. Markdown-fenced JSON and surrounding prose now follow the core output validator's extraction rules; exact verdict schema, independent child/extension authentication and both revision checks remain mandatory, including for schema-less results.
+- Accept a single checkpoint reviewer lane labeled `verifier` when `review_task_id` is supplied, normalizing it to `worker` for unchanged dispatch semantics. Ordinary single/parallel lane restrictions and mandatory high-risk worker/verifier routing remain unchanged. Updated `route_turn` guidance and schema description.
+
+### Tests
+
+- Added fenced pass/fail, revision mismatch, non-JSON prose, artifact mutation, authentication, live Slack summary-shape, fallback/core extraction parity and reviewer dispatch/guard regressions; expanded schema-less exact-contract checks to fenced/prose wrappers.
+- Gateway activation and a fresh live Slack smoke test remain pending; no Hermes core or live plugin-state changes.
+
 ## [0.3.2] - 2026-10-07
 
 ### Fixed
