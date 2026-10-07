@@ -1182,6 +1182,37 @@ def test_forced_delegate_loop_breaker_releases_after_max_attempts():
         ) is None
 
 
+def test_released_undispatched_plan_header_does_not_claim_running_lanes():
+    plugin._ENFORCED_PLATFORMS = {"slack"}
+    session_id, turn_id = "delegate-header-session", "delegate-header-turn"
+    key = plugin._turn_key(session_id, turn_id)
+    lane = {"label": "환불액 계산", "model": "claude-opus-5", "reasoning_effort": "high"}
+    with plugin._POLICY_LOCK:
+        plugin._SKIP_HEADER_SESSIONS.discard(session_id)
+        plugin._TURN_PLANS[key] = {"mode": "single", "lanes": [lane], "dispatched": False}
+
+    def header():
+        return plugin._transform_header(
+            "위임이 거부되어 실행하지 못했습니다.",
+            session_id=session_id,
+            model="claude-opus-5",
+            turn_id=turn_id,
+        ).splitlines()[0]
+
+    # While the dispatch is still pending the declared lane reads as running.
+    assert "환불액 계산" in header() and "실행 중" in header()
+    for _ in range(plugin._MAX_FORCED_DELEGATE_ATTEMPTS + 1):
+        _pending_delegate_request(session_id, turn_id)
+    released = header()
+    assert released.endswith("· 위임 미실행_")
+    assert "실행 중" not in released and "환불액 계산" not in released
+
+    # A dispatch after the release is reported as the lane again.
+    with plugin._POLICY_LOCK:
+        plugin._TURN_PLANS[key]["dispatched"] = True
+    assert "환불액 계산" in header() and "위임 미실행" not in header()
+
+
 def test_forced_delegate_counter_restarts_with_a_new_plan_and_stops_on_dispatch():
     plugin._ENFORCED_PLATFORMS = {"slack"}
     session_id, turn_id = "delegate-reset-session", "delegate-reset-turn"

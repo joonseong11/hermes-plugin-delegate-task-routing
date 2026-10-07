@@ -1664,6 +1664,9 @@ def _transform_header(response_text: str, session_id: str, model: str, **kwargs:
         header = f"_Alex: {main} · 직접 처리_"
     elif plan.get("mode") == "policy_bypass":
         header = f"_Alex: {main} · 라우팅 정책 미적용_"
+    elif plan.get("delegate_forcing_released") and not plan.get("dispatched"):
+        # Nothing was dispatched; the declared lanes must not read as running.
+        header = f"_Alex: {main} · 위임 미실행_"
     else:
         routes = plan.get("actual_routes") or plan.get("lanes") or []
         lane_parts = [_lane_text(route, index) for index, route in enumerate(routes)]
