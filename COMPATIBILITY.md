@@ -4,7 +4,7 @@ The plugin persists independently of the Hermes application image, but behaviora
 
 | Plugin version | Hermes version | Upstream commit | Python | Status | Evidence |
 |---|---|---|---|---|---|
-| 0.5.0 | locally installed `/opt/hermes` (image, no git metadata) | unavailable in installed image | 3.13.5 | Prepared, activation pending | Automatic verification stages removed; `scripts/verify.sh` in the gateway container from a separate checkout: 186 tests + installed private-symbol contract; no gateway restart or live Slack smoke |
+| 0.5.0 | locally installed `/opt/hermes` (image, no git metadata) | unavailable in installed image | 3.13.5 | Prepared, activation pending | Automatic verification stages removed and `delegate_task` forcing capped; `scripts/verify.sh` in the gateway container from a separate checkout: 189 tests + installed private-symbol contract; no gateway restart or live Slack smoke |
 | 0.4.0 | locally installed `/opt/hermes` (image, no git metadata) | unavailable in installed image | 3.13.5 | Prepared, activation pending | Full hermetic suite + installed private-symbol contract; fixed work-type models, operator overrides and all recovery suffixes; live Codex additions return HTTP 200; Opus 5 catalog confirmed, inference HTTP 429; no gateway restart/live Slack smoke |
 | 0.3.3 | locally installed `/opt/hermes` | see local git revision | 3.13.5 | Prepared, activation pending | `scripts/verify.sh` contract suite, hermetic fenced reviewer output and single-verifier lane regressions; no gateway restart or live Slack test for this version |
 | 0.2.9 | 0.21.1 | `fef0e16f` | 3.13.5 | Supported locally | 48 tests + installed contract probe; authenticated non-sensitive lifecycle and worker/verifier completion-chain ownership |
