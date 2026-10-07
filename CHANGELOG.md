@@ -18,7 +18,7 @@ All notable changes to this project are documented here.
 ### Verification
 
 - Removed `tests/test_development_review.py` and `tests/test_risk_policy.py`; added regressions for the removed mode, ignored `phase`, wording that used to force verification, legacy-record claims and replay rejection. The core/registry/positional/JSON dispatch-and-completion contract test moved to `tests/test_routing.py` and now covers an ordinary `single` plan.
-- The tests that need no Hermes source pass off-host (104). The full `scripts/verify.sh` suite against the installed Hermes, the gateway restart and the Slack smoke test are pending.
+- `scripts/verify.sh` passed in the gateway container against the installed Hermes from a separate checkout of this branch: 186 tests and the installed private-symbol contract. The gateway restart and the Slack smoke test are pending.
 
 ## [0.4.0] - 2026-10-07
 
