@@ -25,14 +25,14 @@ A version is declared in five places, and they must always agree:
 - **Major**: reserved for `1.0.0` and later breaking changes.
 - Changes to documentation, tests or CI only do not change the version and are not tagged.
 
-One version number belongs to exactly one commit. Never reuse a number for different code, and never skip a number.
+One version number belongs to exactly one release commit, the one its tag points at. Later documentation, test or CI commits keep declaring that version; they are not a new release. Never reuse a number for different code, and never skip a number.
 
 ## Release procedure
 
 Do these in order. Do not start the next version until the last step is done for the current one.
 
 1. Create a new branch from an up-to-date `main`: `<type>/<short-topic>-<YYYYMMDD>`.
-2. Make the change. In the final commit of the branch, set the new version in all four files and add the `CHANGELOG.md` section dated today.
+2. Make the change. In the final commit of the branch, set the new version in all four files and add the `CHANGELOG.md` section. Date it with the day the release is merged and tagged; if the merge slips to a later day, correct the date on the branch before merging.
 3. Run `scripts/verify.sh` and `scripts/check-version.sh`. Both must pass.
 4. Push the branch and open a pull request against `main`. CI must pass.
 5. Merge with a **merge commit**. Do not squash or rebase: the tag must point at a commit that keeps its hash.
@@ -62,7 +62,7 @@ Because the checkout is live, keep it clean: no uncommitted changes left across 
 ## CHANGELOG rules
 
 - The date in a heading is the date the version was tagged.
-- `Unreleased` is allowed only on the topmost section, while its branch is still open. Replace it with the date before tagging.
+- `## [Unreleased]` is allowed only as the topmost section, while its branch is still open. `scripts/check-version.sh` skips it on branches and pull requests and rejects it on a tag. Replace it with the version and date in the final commit, before merging.
 - Never edit the section of a version that is already tagged, except to correct a factual error.
 
 ## Known gaps in history

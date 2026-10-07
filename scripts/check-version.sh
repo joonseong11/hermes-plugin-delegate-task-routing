@@ -16,15 +16,28 @@ def one(pattern, text, label):
         raise SystemExit(f"missing {label}")
     return match.group(1)
 
+def changelog_version(text):
+    # `## [Unreleased]` may sit on top while a release branch is open; a tag must not have it.
+    heads = re.findall(r'^## \[([^]]+)\]', text, re.MULTILINE)
+    if heads and heads[0].lower() == "unreleased":
+        if os.environ.get("GITHUB_REF_TYPE", "") == "tag":
+            raise SystemExit("CHANGELOG.md still has an Unreleased section on a tagged release")
+        heads = heads[1:]
+    if not heads:
+        raise SystemExit("missing CHANGELOG release")
+    return heads[0]
+
 values = {
     "code": one(r'^PLUGIN_VERSION = "([^"]+)"$', code, "PLUGIN_VERSION"),
     "manifest": one(r'^version:\s*([^\s]+)$', manifest, "manifest version"),
     "readme": one(r'^Current release: `v([^`]+)`', readme, "README release"),
-    "changelog": one(r'^## \[([^]]+)\]', changelog, "CHANGELOG release"),
+    "changelog": changelog_version(changelog),
 }
 if len(set(values.values())) != 1:
     raise SystemExit(f"version mismatch: {values}")
 version = next(iter(values.values()))
+if not re.fullmatch(r'\d+\.\d+\.\d+', version):
+    raise SystemExit(f"version is not X.Y.Z: {version}")
 ref_type = os.environ.get("GITHUB_REF_TYPE", "")
 ref_name = os.environ.get("GITHUB_REF_NAME", "")
 if ref_type == "tag" and ref_name != f"v{version}":
