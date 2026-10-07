@@ -1125,6 +1125,92 @@ def test_forced_route_loop_breaker_bypasses_after_max_attempts():
         assert key not in plugin._FORCED_ROUTE_COUNTS
 
 
+def _pending_delegate_request(session_id, turn_id):
+    return plugin._llm_request_policy(
+        {"messages": []},
+        session_id=session_id,
+        turn_id=turn_id,
+        task_id="parent-task",
+        platform="slack",
+        api_mode="chat_completions",
+    )
+
+
+def test_forced_delegate_loop_breaker_releases_after_max_attempts():
+    plugin._ENFORCED_PLATFORMS = {"slack"}
+    session_id, turn_id = "delegate-loop-session", "delegate-loop-turn"
+    key = plugin._turn_key(session_id, turn_id)
+    with plugin._POLICY_LOCK:
+        plugin._TURN_PLANS[key] = {"mode": "single", "lanes": [], "dispatched": False}
+
+    # The plan never dispatches (rejected tasks, or list/steer/stop calls).
+    for attempt in range(plugin._MAX_FORCED_DELEGATE_ATTEMPTS):
+        forced = _pending_delegate_request(session_id, turn_id)
+        assert forced is not None, f"attempt {attempt} should force delegate_task"
+        assert forced["request"]["tool_choice"]["function"]["name"] == "delegate_task"
+
+    # Later requests are left alone so the parent can answer in text.
+    assert _pending_delegate_request(session_id, turn_id) is None
+    assert _pending_delegate_request(session_id, turn_id) is None
+    with plugin._POLICY_LOCK:
+        plan = plugin._TURN_PLANS[key]
+        # The declared plan stays in force; only the forced tool choice is dropped.
+        assert plan["mode"] == "single"
+        assert plan["delegate_forcing_released"] is True
+        assert plan["dispatched"] is False
+
+    agent = SimpleNamespace(session_id=session_id, _current_turn_id=turn_id)
+    assert plugin._delegate_forcing_exhausted(agent) is True
+    blocked = plugin._pre_tool_policy(
+        "terminal",
+        session_id=session_id,
+        turn_id=turn_id,
+        task_id="parent-task",
+        platform="slack",
+    )
+    assert blocked == {
+        "action": "block",
+        "message": plugin._DELEGATE_FORCING_RELEASED_NOTE,
+    }
+    for allowed in ("route_turn", "delegate_task"):
+        assert plugin._pre_tool_policy(
+            allowed,
+            session_id=session_id,
+            turn_id=turn_id,
+            task_id="parent-task",
+            platform="slack",
+        ) is None
+
+
+def test_forced_delegate_counter_restarts_with_a_new_plan_and_stops_on_dispatch():
+    plugin._ENFORCED_PLATFORMS = {"slack"}
+    session_id, turn_id = "delegate-reset-session", "delegate-reset-turn"
+    key = plugin._turn_key(session_id, turn_id)
+    agent = SimpleNamespace(session_id=session_id, _current_turn_id=turn_id)
+    with plugin._POLICY_LOCK:
+        plugin._TURN_PLANS[key] = {"mode": "parallel", "lanes": [], "dispatched": False}
+    for _ in range(plugin._MAX_FORCED_DELEGATE_ATTEMPTS):
+        assert _pending_delegate_request(session_id, turn_id) is not None
+    assert _pending_delegate_request(session_id, turn_id) is None
+
+    # route_turn stores a fresh plan dict, which is forced again from zero.
+    with plugin._POLICY_LOCK:
+        plugin._TURN_PLANS[key] = {"mode": "single", "lanes": [], "dispatched": False}
+    assert plugin._delegate_forcing_exhausted(agent) is False
+    forced = _pending_delegate_request(session_id, turn_id)
+    assert forced["request"]["tool_choice"]["function"]["name"] == "delegate_task"
+
+    # A dispatched plan is neither forced nor counted as exhausted.
+    with plugin._POLICY_LOCK:
+        plan = plugin._TURN_PLANS[key]
+        plan["forced_delegate_attempts"] = plugin._MAX_FORCED_DELEGATE_ATTEMPTS
+        plan["dispatched"] = True
+    assert _pending_delegate_request(session_id, turn_id) is None
+    assert plugin._delegate_forcing_exhausted(agent) is False
+    with plugin._POLICY_LOCK:
+        assert "delegate_forcing_released" not in plugin._TURN_PLANS[key]
+
+
 def test_accepted_plan_clears_forced_route_counter():
     key = plugin._turn_key("clear-session", "clear-turn")
     with plugin._POLICY_LOCK:

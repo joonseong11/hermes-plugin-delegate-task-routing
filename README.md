@@ -30,7 +30,7 @@ A review can only cover work that already exists. The plugin has no sequential m
 
 Records written by earlier versions are handled as follows. A delegation left in a `workers_dispatched` or `verifiers_dispatched` stage is accepted once as an ordinary completion; no verifier is dispatched for it. The `development_reviews` plugin-state key is no longer read or written.
 
-After a delegated decision, the next model call is forced to `delegate_task`. A `pre_tool_call` gate blocks unrelated tools between the decision and dispatch. Subagents and non-Slack runtimes are excluded from the parent-turn gate and from Alex headers.
+After a delegated decision, the next model call is forced to `delegate_task`. The forcing stops after three forced calls that dispatch nothing (rejected tasks, or `list`/`steer`/`stop` calls): the plan and the gate stay in place, but the parent may then report the blocker in text or call `route_turn` again. A `pre_tool_call` gate blocks unrelated tools between the decision and dispatch. Subagents and non-Slack runtimes are excluded from the parent-turn gate and from Alex headers.
 
 ## Added task fields
 

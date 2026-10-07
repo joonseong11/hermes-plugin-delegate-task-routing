@@ -90,6 +90,13 @@ _FORCED_ROUTE_REQUESTS: set[str] = set()
 # the iteration budget burns out.
 _FORCED_ROUTE_COUNTS: dict[tuple[str, str], int] = {}
 _MAX_FORCED_ROUTE_ATTEMPTS = 3
+# Forced delegate_task requests allowed per accepted plan before the dispatch
+# is made. A plan that still has not dispatched after this many forced calls
+# (rejected tasks, or list/steer/stop calls that dispatch nothing) stops being
+# forced, so the parent can report the blocker in text or re-declare the plan
+# instead of repeating the call until the core tool-loop guardrail halts the
+# turn. The count lives on the plan, so a new route_turn starts from zero.
+_MAX_FORCED_DELEGATE_ATTEMPTS = 3
 # Last reasoning effort observed in each Slack parent session's own LLM
 # request payload. registry.dispatch gives tool handlers no agent object, so
 # this locally observed value is the only honest source for the header's
@@ -1527,6 +1534,18 @@ def _llm_request_policy(request: dict[str, Any], **kwargs: Any) -> Any:
     if plan.get("mode") in {"single", "parallel"} and not plan.get(
         "dispatched"
     ):
+        with _POLICY_LOCK:
+            attempts = int(plan.get("forced_delegate_attempts") or 0)
+            if attempts >= _MAX_FORCED_DELEGATE_ATTEMPTS:
+                if not plan.get("delegate_forcing_released"):
+                    plan["delegate_forcing_released"] = True
+                    _LOG.warning(
+                        "delegate_task forcing made no dispatch after %d "
+                        "attempts for %s; releasing the forced tool choice "
+                        "for this plan", attempts, key,
+                    )
+                return None
+            plan["forced_delegate_attempts"] = attempts + 1
         api_mode = kwargs.get("api_mode")
         if not isinstance(_DELEGATE_TASK_REQUEST_SCHEMA, Mapping):
             raise RuntimeError("delegate_task request schema was not retained at plugin registration")
@@ -1543,6 +1562,28 @@ def _llm_request_policy(request: dict[str, Any], **kwargs: Any) -> Any:
             rewritten["parallel_tool_calls"] = False
         return {"request": rewritten, "source": PLUGIN_ID, "reason": "delegation required"}
     return None
+
+
+_DELEGATE_FORCING_RELEASED_NOTE = (
+    "delegate_task did not dispatch the declared route_turn plan after "
+    f"{_MAX_FORCED_DELEGATE_ATTEMPTS} forced attempts, so it is no longer "
+    "forced. Do not repeat the same call: tell the user in text what blocked "
+    "the delegation, or call route_turn again to declare a plan you can carry out."
+)
+
+
+def _delegate_forcing_exhausted(parent_agent: Any) -> bool:
+    """True once the current plan has used up its forced delegate_task calls."""
+    session_id = getattr(parent_agent, "session_id", "") or ""
+    turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
+    with _POLICY_LOCK:
+        plan = _TURN_PLANS.get(_turn_key(session_id, turn_id))
+        return bool(
+            plan
+            and not plan.get("dispatched")
+            and int(plan.get("forced_delegate_attempts") or 0)
+            >= _MAX_FORCED_DELEGATE_ATTEMPTS
+        )
 
 
 def _pre_tool_policy(tool_name: str, **kwargs: Any) -> Any:
@@ -1574,6 +1615,8 @@ def _pre_tool_policy(tool_name: str, **kwargs: Any) -> Any:
         and not plan.get("dispatched")
         and tool_name not in {"route_turn", "delegate_task"}
     ):
+        if plan.get("delegate_forcing_released"):
+            return {"action": "block", "message": _DELEGATE_FORCING_RELEASED_NOTE}
         return {"action": "block", "message": "delegate_task must follow the declared route_turn plan"}
     return None
 
@@ -1793,7 +1836,10 @@ def register(ctx) -> None:
                 except (RuntimeError, ValueError) as exc:
                     from tools.registry import tool_error
 
-                    return tool_error(str(exc))
+                    message = str(exc)
+                    if _delegate_forcing_exhausted(parent_agent):
+                        message = f"{message}. {_DELEGATE_FORCING_RELEASED_NOTE}"
+                    return tool_error(message)
             # Injection and dispatch bookkeeping belong to the patched core
             # entrypoint; both registry and live-dispatch calls use it.
             return delegate_module.delegate_task(
