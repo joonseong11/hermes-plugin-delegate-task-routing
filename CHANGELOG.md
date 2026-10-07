@@ -40,12 +40,12 @@ All notable changes to this project are documented here.
 - Added regressions through the patched core entrypoint (not just the registry), plus schema coercion, pre-launch revision changes, failed verdict/malformed output, strict schema-less acceptance, body-preserving status/errors.
 - No gateway restart or Hermes core changes; live Slack activation remains pending.
 
-## [0.3.1] - Unreleased (local)
+## [0.3.1] - 2026-10-02
 
 - Added profile-scoped development task review checkpoints, exact git-tree fingerprints, independent single-lane review verdict authenticated from the core async ledger, safe progress and fail-closed final-output readiness for scoped Slack development tasks. Reviewed revisions are reused; later changes invalidate readiness. High-risk worker/verifier routing remains mandatory.
 - Added hermetic review-gate contracts and a self-deployment refusal for installations where the git checkout is the live plugin directory. Gateway activation and platform smoke testing remain pending.
 
-## [0.3.0] - Unreleased (local)
+## [0.3.0] - Never tagged (shipped as part of 0.3.1)
 
 ### Changed
 
