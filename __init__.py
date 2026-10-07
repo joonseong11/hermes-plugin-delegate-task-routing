@@ -14,26 +14,33 @@ from __future__ import annotations
 
 import contextvars
 import copy
+import hashlib
 import inspect
 import json
 import logging
+import os
 import re
 import sqlite3
+import subprocess
 import threading
 import time
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-PLUGIN_VERSION = "0.2.8"
+PLUGIN_VERSION = "0.3.2"
 PLUGIN_ID = "delegate-task-routing"
 _PATCH_MARKER = "_delegate_task_routing_plugin_v1"
 _ROUTE_FIELDS = ("label", "model", "reasoning_effort", "toolsets")
 _LOG = logging.getLogger(__name__)
 DEFAULT_ALLOWED_MODELS = (
-    "gpt-5.6-luna-900k",
-    "gpt-5.6-terra-900k",
-    "gpt-5.6-sol-900k",
+    "claude-opus-4-8",
+    "claude-fable-5.1",
+    "gpt-6-astra",
+    "gpt-6.1-sol",
+    "gpt-6-luna",
+    "claude-sonnet-5",
 )
 DEFAULT_ALLOWED_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 DEFAULT_ALLOWED_TOOLSETS = (
@@ -73,6 +80,7 @@ _FORCED_ROUTE_REQUESTS: set[str] = set()
 # cause), enforcement must give up for the turn instead of re-forcing until
 # the iteration budget burns out.
 _FORCED_ROUTE_COUNTS: dict[tuple[str, str], int] = {}
+_TURN_RISK_REQUIREMENTS: dict[tuple[str, str], bool | None] = {}
 _MAX_FORCED_ROUTE_ATTEMPTS = 3
 # Last reasoning effort observed in each Slack parent session's own LLM
 # request payload. registry.dispatch gives tool handlers no agent object, so
@@ -81,11 +89,288 @@ _MAX_FORCED_ROUTE_ATTEMPTS = 3
 # header keeps "unknown" rather than inventing one.
 _MAIN_EFFORTS: dict[str, str] = {}
 _PLUGIN_STATE: Any = None
+_DELEGATE_TASK_REQUEST_SCHEMA: dict[str, Any] | None = None
 _ENFORCED_PLATFORMS: set[str] = {"slack"}
 _HEADER_RE = re.compile(r"^_Alex:\s*[^\n]*_\s*\n*", re.IGNORECASE)
 _ASYNC_DELEGATION_RE = re.compile(
     r"\[ASYNC DELEGATION(?: BATCH)? COMPLETE — ([^\]]+)\]"
 )
+# Deterministic backstops complement the model-facing semantic policy. Explicit
+# high-risk intent must use worker_verifier; explicit routine/local intent must
+# not. Unclassified or genuinely ambiguous turns remain model-classified so a
+# lexical false negative cannot prohibit a conservative worker_verifier route.
+_HIGH_RISK_TURN_RE = re.compile(
+    r"(?:\b(?:send|post|publish|submit|deploy(?:ment)?s?|release|transfer|pay|"
+    r"account(?:ing)?|bookkeep(?:ing)?|invoice|reconcile|legal|security|"
+    r"auth(?:entication|orization)?|payments?|billing|refunds?|"
+    r"permissions?|access[ -]?control|credentials?|irreversible|"
+    r"high[- ](?:risk|impact|cost)|high[ -]error[ -]cost)\b|"
+    r"\bexternal\b.{0,32}\b(?:write|change|update|delete)\b|"
+    r"\b(?:write|change|update|delete)\b.{0,32}\bexternal\b|"
+    r"전송|게시|발행|제출|배포|릴리스|금전|결제|회계|정산|법률|법무|보안|"
+    r"권한|인증|로그인|접근.?제어|자격.?증명|환불|되돌릴.?수.?없|비가역|고위험|오류.?비용|"
+    r"외부.{0,16}(?:쓰기|기록|변경|수정|삭제|업데이트))",
+    re.IGNORECASE,
+)
+# Operations/production nouns alone are not actions. Only exempt explicit reads
+# or explanations with no mutation cue; ambiguous operational requests stay high.
+# Match mutations across the whole request (also after a read-only first clause).
+_OPERATIONAL_SCOPE_RE = re.compile(r"\b(?:production|prod)\b|운영|프로덕션", re.IGNORECASE)
+_MUTATION_RE = re.compile(
+    r"\b(?:writ\w*|chang\w*|updat\w*|delet\w*|remov\w*|creat\w*|insert\w*|"
+    r"alter\w*|drop\w*|truncat\w*|restart\w*|reboot\w*|stop(?:s|ped|ping)?|start(?:s|ed|ing)?|"
+    r"shutdown|kill|migrat\w*|appl(?:y|ies|ied|ying)|execut\w*|run|enabl\w*|disabl\w*|"
+    r"scal(?:e[sd]?|ing)|rollback|roll\s+back|restor\w*|drain\w*|promot\w*|switch\w*|"
+    r"toggl\w*|rotat\w*|reset\w*|replac\w*|narrow\w*|modif\w*|set)\b|"
+    r"쓰기|기록|변경|수정|삭제|추가|생성|삽입|재시작|재기동|중지|시작|종료|"
+    r"적용|실행|활성|비활성|전환|교체|초기화|반영|좁히|바꿔|바꾸|롤백|복원|복구|증설|축소|조정|켜|끄",
+    re.IGNORECASE,
+)
+_READ_ONLY_TURN_RE = re.compile(
+    r"\b(?:read(?:[ -]only)?|look[ -]?up|explain|status|inspect|list|compare)\b|"
+    r"읽|읽기.?전용|조회|설명|차이|상태|알려",
+    re.IGNORECASE,
+)
+_ROUTING_POLICY_RE = re.compile(
+    r"\b(?:routing|delegation|verifi\w*)\b.{0,32}\b(?:policy|triggers?|criteria)\b|"
+    r"(?:라우팅|위임|검증).{0,16}(?:기준|정책)", re.IGNORECASE,
+)
+_ORDINARY_TURN_RE = re.compile(
+    r"(?:\b(?:local|internal|reversible|routine|draft|notes?|unit[ -]?tests?|"
+    r"refactor|format|summari[sz]e|analysis|research)\b|"
+    r"로컬|내부|가역|되돌릴.?수.?있|일반|초안|메모|단위.?테스트|리팩터|포맷|요약|분석|조사)",
+    re.IGNORECASE,
+)
+
+# Task-level checkpoint gate. Profile-scoped plugin state survives gateway restarts;
+# a repository snapshot is recomputed by code rather than supplied by the model.
+_DEV_REQUEST_RE = re.compile(
+    r"\b(?:implement|coding|develop|refactor|fix\s+(?:a\s+)?bug|"
+    r"(?:edit|write|change|build)\s+(?:the\s+|a\s+)?code)\b|"
+    r"개발|구현|버그|리팩터|코드.{0,12}(?:수정|작성|변경)|(?:수정|작성|변경).{0,12}코드",
+    re.IGNORECASE,
+)
+_PROGRESS_TURNS: set[tuple[str, str]] = set()
+_REVIEW_SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "verdict": {"type": "string", "enum": ["pass", "fail"]},
+        "revision": {"type": "string"},
+        "findings": {"type": "string"},
+    },
+    "required": ["verdict", "revision", "findings"],
+}
+
+def _review_records() -> dict[str, dict[str, Any]]:
+    if _PLUGIN_STATE is None:
+        raise RuntimeError("profile-scoped review state unavailable")
+    records = _PLUGIN_STATE.get("development_reviews", {})
+    if not isinstance(records, dict):
+        raise RuntimeError("invalid development review state")
+    return records
+
+def _save_review(task: dict[str, Any]) -> None:
+    with _POLICY_LOCK:
+        records = dict(_review_records())
+        records[task["task_id"]] = task
+        if len(records) > 100:
+            closed = sorted((t for t in records.values() if isinstance(t, dict) and t.get("phase") == "closed"),
+                            key=lambda t: t.get("created_at", 0))
+            while len(records) > 80 and closed:
+                records.pop(closed.pop(0)["task_id"], None)
+        _PLUGIN_STATE.set("development_reviews", records)
+
+
+def _review_task(session_id: str, task_id: str = "") -> dict[str, Any] | None:
+    with _POLICY_LOCK:
+        records = _review_records()
+        if task_id:
+            task = records.get(task_id)
+            return (dict(task) if isinstance(task, dict)
+                    and _owned_session(task.get("session_id", ""), session_id) else None)
+        candidates = [dict(t) for t in records.values() if isinstance(t, dict)
+                      and t.get("phase") != "closed"
+                      and _owned_session(t.get("session_id", ""), session_id)]
+        return max(candidates, key=lambda t: t.get("created_at", 0)) if candidates else None
+
+def _artifact_revision(root: str) -> str:
+    """Hash HEAD plus tracked/untracked bytes, including deletions and symlinks.
+
+    The entire repository is conservative; ignored/build artifacts are excluded.
+    """
+    path = Path(root).resolve(strict=True)
+    if not path.is_dir():
+        raise ValueError("review root must be a directory")
+    def git(*args: str) -> bytes:
+        return subprocess.check_output(["git", "-C", str(path), *args], timeout=30,
+                                       stderr=subprocess.DEVNULL)
+    top = Path(os.fsdecode(git("rev-parse", "--show-toplevel")).strip()).resolve()
+    if top != path:
+        raise ValueError("review root must be the repository top level")
+    names = sorted(set(n for n in git("ls-files", "-z", "--cached", "--others", "--exclude-standard").split(b"\0") if n))
+    if len(names) > 20000:
+        raise ValueError("review scope exceeds file limit")
+    digest = hashlib.sha256()
+    digest.update(git("rev-parse", "HEAD"))
+    for name in names:
+        candidate = path / os.fsdecode(name)
+        digest.update(len(name).to_bytes(8, "big") + name)
+        if candidate.is_symlink():
+            digest.update(b"SYMLINK" + os.fsencode(os.readlink(candidate)))
+        elif not candidate.exists():
+            digest.update(b"DELETED")
+        elif candidate.is_file():
+            digest.update(b"FILE")
+            with candidate.open("rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
+        else:
+            raise ValueError("unsupported artifact type")
+    return digest.hexdigest()
+
+def _review_status(task: dict[str, Any]) -> dict[str, Any]:
+    revision = _artifact_revision(task["root"]) if task.get("root") else None
+    ready = bool(revision and task.get("reviewed_revision") == revision
+                 and task.get("phase") in {"reviewed", "closed"})
+    return {"task_id": task["task_id"], "phase": task["phase"],
+            "revision": revision, "reviewed_revision": task.get("reviewed_revision"),
+            "review_trigger": task.get("review_trigger"), "ready": ready}
+
+def _review_action(args: dict[str, Any], **kw: Any) -> str:
+    from tools.registry import tool_error
+    session_id, turn_id = _resolve_turn_context(kw.get("parent_agent"), kw)
+    if not session_id or not turn_id:
+        return tool_error("development review requires a parent session and turn")
+    action = str(args.get("action") or "")
+    try:
+        with _POLICY_LOCK:
+            task = _review_task(session_id, str(args.get("task_id") or ""))
+            if action == "begin":
+                if task:
+                    if task.get("root") is None:  # auto-created provisional task
+                        root = str(Path(str(args.get("root") or "")).resolve(strict=True))
+                        task.update(root=root, revision=_artifact_revision(root))
+                        _save_review(task)
+                        return json.dumps(_review_status(task))
+                    raise ValueError("active task already exists; use its task_id")
+                root = str(Path(str(args.get("root") or "")).resolve(strict=True))
+                task = {"task_id": uuid.uuid4().hex, "session_id": session_id,
+                        "root": root, "phase": "working", "revision": _artifact_revision(root),
+                        "reviewed_revision": None, "review_trigger": None,
+                        "created_at": time.time()}
+                _save_review(task)
+            elif task is None:
+                raise ValueError("no owned development task; call begin with repository root")
+            elif action == "progress":
+                _PROGRESS_TURNS.add(_turn_key(session_id, turn_id))
+            elif action == "checkpoint":
+                if not task.get("root"):
+                    raise ValueError("begin with repository root before checkpoint")
+                revision = _artifact_revision(task["root"])
+                if task.get("reviewed_revision") == revision and task["phase"] in {"reviewed", "closed"}:
+                    return json.dumps(_review_status(task))
+                if task.get("phase") == "review_pending" and task.get("revision") == revision:
+                    return json.dumps(_review_status(task))
+                task.update(phase="review_due", revision=revision,
+                            review_trigger=str(args.get("trigger") or "completion"),
+                            reviewed_revision=None, delegation_id=None)
+                _save_review(task)
+            elif action == "ready":
+                status = _review_status(task)
+                if not status["ready"]:
+                    raise ValueError("exact current artifact has no completed independent review")
+                return json.dumps(status)
+            elif action == "close":
+                if not _review_status(task)["ready"]:
+                    raise ValueError("cannot close an unreviewed development task")
+                task["phase"] = "closed"
+                _save_review(task)
+            elif action != "status":
+                raise ValueError("action must be begin, checkpoint, progress, status, ready, or close")
+            return json.dumps(_review_status(task))
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        return tool_error(str(exc))
+
+# --- Cross-provider routing + graceful fallback ---------------------------
+# A routed lane model may belong to a DIFFERENT provider than the parent
+# gateway (e.g. parent on anthropic/claude-opus while a lane requests a codex
+# gpt-*). The native child builder inherits the parent provider when no
+# override_provider is passed, so a gpt-* model gets sent to api.anthropic.com
+# and 404s ("model: gpt-5-6-terra-900k"). We classify the model family, pin the
+# matching provider via override_provider (letting the runtime re-derive
+# base_url/api_mode/credentials), and attach an Anthropic-peer fallback chain so
+# a real codex outage degrades to a working model with a visible requested→actual
+# note instead of a silent failed child.
+_ANTHROPIC_PROVIDER = "anthropic"
+_CODEX_PROVIDER = "openai-codex"
+
+
+def _model_provider_family(model: str) -> str | None:
+    """Canonical provider a routed model id belongs to, or None if unknown.
+
+    Prefix-based so forward-compat ids (e.g. a future gpt-6-*) still resolve.
+    """
+    text = str(model or "").strip().lower()
+    if not text:
+        return None
+    if text.startswith(("gpt-", "gpt5", "o1", "o1-", "o3", "o3-", "o4", "o4-", "codex")):
+        return _CODEX_PROVIDER
+    if text.startswith("claude"):
+        return _ANTHROPIC_PROVIDER
+    return None
+
+
+def _anthropic_peer_for(model: str) -> str | None:
+    """Explicit recovery peers, never a guessed generation-wide fallback.
+
+    Luna uses the cost-appropriate Sonnet peer; Sol uses Opus; Astra uses Fable.
+    Sonnet is also the general/medium Claude alternative to the Sol default.
+    Recovery does not change routine model selection. Unknown IDs
+    have no automatic peer. The caller must also check the current allowlist.
+    """
+    return {
+        "gpt-6-luna": "claude-sonnet-5",
+        "gpt-6.1-sol": "claude-opus-4-8",
+        "gpt-6-astra": "claude-fable-5.1",
+    }.get(model)
+
+
+def _routed_fallback_config(
+    model: str,
+    allowed_models: Sequence[str],
+    routing_cfg: Any,
+    *,
+    automatic_peer: bool,
+) -> dict[str, Any]:
+    """Keep fallback inside the route's allowlist and operator-owned config.
+
+    Explicit chains (including []) win. Reject malformed or unauthorized routes
+    before construction rather than letting the native normalizer silently drop
+    them. Copy the config so simultaneous lanes never mutate shared defaults.
+    """
+    if routing_cfg is not None and not isinstance(routing_cfg, Mapping):
+        raise ValueError("Routed fallback config must be an object")
+    cfg = copy.deepcopy(dict(routing_cfg or {}))
+    declared = cfg.get("fallback_providers")
+    if declared is not None:
+        if not isinstance(declared, list):
+            raise ValueError("Routed fallback_providers must be a list")
+        for entry in declared:
+            if not isinstance(entry, Mapping):
+                raise ValueError("Routed fallback entries must be objects")
+            peer = entry.get("model")
+            provider = entry.get("provider")
+            if not isinstance(peer, str) or peer not in allowed_models:
+                raise ValueError("Routed fallback model is not in allowed_models")
+            if not provider or provider != _model_provider_family(peer):
+                raise ValueError("Routed fallback provider does not match the approved model")
+    else:
+        peer = _anthropic_peer_for(model) if automatic_peer else None
+        cfg["fallback_providers"] = (
+            [{"provider": _ANTHROPIC_PROVIDER, "model": peer}]
+            if peer and peer in allowed_models else []
+        )
+    return cfg
 
 ROUTE_TURN_SCHEMA = {
     "name": "route_turn",
@@ -96,26 +381,61 @@ ROUTE_TURN_SCHEMA = {
         "answer immediately, because delegation runs in the background and sends "
         "the user a second message later; it must buy substantial independent "
         "work. Use single for one bounded chunk of substantial work; parallel "
-        "for two or more independent outcomes; worker_verifier for writes, "
-        "deployments, production operations, money, legal/security decisions, or "
-        "any result needing independent verification. When uncertain about RISK "
+        "for two or more independent outcomes, not implementation plus its tests. "
+        "General implementation uses single with tests in the same worker lane; "
+        "the parent reviews the evidence, not an automatic second verifier. "
+        "For a recognized reversible development task, use development_review "
+        "to begin a repository-scoped task and checkpoint only at meaningful "
+        "milestones or completion; use review_task_id with a single independent "
+        "reviewer after checkpoint. Do not repeat review for an unchanged revision. "
+        "This task-level gate never substitutes for mandatory high-risk "
+        "worker_verifier routing. "
+        "Ordinary local analysis, research, "
+        "implementation, and reversible file edits use direct, single, or parallel "
+        "according to scope. worker_verifier is reserved for and REQUIRED for "
+        "external writes (send/post/publish/submit), deployments or production "
+        "changes, money/accounting, legal or security work, permission/access "
+        "changes, irreversible actions, and other explicitly high-error-cost work. "
+        "Do not select worker_verifier for routine work merely because it includes "
+        "a local write or benefits from extra review. Mere mentions of operations "
+        "(운영), fast mode, or read-only production status do not require delegation "
+        "or independent verification. Small reversible local edits can stay direct. "
+        "This exception does not cover routing/verification policy changes, legal, "
+        "security, money, external writes, or mixed read-and-mutate requests. "
+        "When risk is ambiguous, choose "
+        "worker_verifier. "
+        "For a user-requested skill refresh, choose direct with empty lanes, then call "
+        "skill_view for the changed skills before planning or editing; do not delegate "
+        "merely to reload skills. If refreshed instructions reveal a higher-risk scope, "
+        "call route_turn again before any write to declare the required lanes. "
+        "When uncertain about RISK "
         "choose the higher mode; when merely uncertain whether delegation is "
         "worth it, choose direct. With mode=direct, lanes MUST be the empty "
         "array []. "
         "Per-lane model assignment — pick the cheapest model that is safe: "
-        "Luna at low/medium for trivial or mechanical work (counting, reformatting, "
-        "single-file reads, simple visual QA); Terra at medium/high for general "
-        "analysis, research, and code work; Sol at high/xhigh only for high-risk "
-        "work (legal/financial wording, production writes, security review, final "
-        "adversarial verification); Astra at xhigh/max only for the most complex, "
-        "ambiguous multi-domain synthesis, architecture, long-context integration, "
-        "or exceptionally difficult problems. Do not assign Astra when a lower "
-        "model can safely complete the work; Astra does not replace Sol's "
-        "independent high-risk verification. Never assign Sol or Astra to trivial "
-        "tasks; give identical tasks identical models. Declare the exact model, effort, and "
-        "least-privilege toolsets for every lane. Call route_turn at most once per "
-        "turn; never call it again after a plan is accepted, and never in an "
-        "async-delegation completion turn (routing is already recorded there)."
+        "gpt-6-luna (Luna) at low/medium for simple or mechanical delegated work "
+        "(extraction, reformatting, deterministic checks, simple visual QA); "
+        "gpt-6.1-sol (Sol) at medium/high is the general default for analysis, "
+        "research, implementation, and code work. claude-sonnet-5 (Sonnet) at medium "
+        "is the general/medium Claude alternative to Sol for those tasks; "
+        "Sol remains the delegation default. claude-opus-4-8 (Opus) at high/max "
+        "is for critical independent verification (legal/financial correctness, "
+        "production safety, security, adversarial review) and Codex fallback. "
+        "gpt-6-astra (Astra) at xhigh/max is reserved for exceptional architecture "
+        "and unusually difficult multi-domain synthesis. Do not assign Astra when "
+        "a lower model can safely complete the work; Astra does not replace Opus's "
+        "independent critical verification. claude-fable-5.1 (Fable) is reserved "
+        "for extreme long-context integration, not routine work. Codex recovery "
+        "peers are Luna→Sonnet, Sol→Opus, Astra→Fable, only if the peer is allowlisted. "
+        "Luna→Sonnet is the cost-appropriate outage recovery; do not escalate "
+        "simple Luna work to Opus or Fable automatically. Unknown models "
+        "have no automatic fallback. Give identical tasks identical models. "
+        "Declare the exact model, effort, and "
+        "least-privilege toolsets for every lane. Normally call route_turn once per "
+        "turn. Only a direct skill-refresh preflight may reroute before any write "
+        "when the refreshed instructions require a higher-risk mode. Never reroute "
+        "an accepted delegation or an async-delegation completion/verification turn "
+        "(routing is already recorded there)."
     ),
     "parameters": {
         "type": "object",
@@ -125,6 +445,7 @@ ROUTE_TURN_SCHEMA = {
                 "enum": ["direct", "single", "parallel", "worker_verifier"],
             },
             "reason": {"type": "string", "minLength": 1},
+            "review_task_id": {"type": "string", "description": "Only for a single independent development checkpoint reviewer; copy the ID from development_review checkpoint."},
             "lanes": {
                 "type": "array",
                 "description": "Worker/verifier lanes. MUST be [] when mode=direct.",
@@ -439,6 +760,60 @@ def _install_patches(
         route = routes.get(int(task_index), {})
         if route.get("model"):
             kwargs["model"] = route["model"]
+            # Cross-provider routing + graceful fallback. If the requested lane
+            # model belongs to a different provider than the parent gateway,
+            # resolve that provider's FULL credential bundle (base_url, api_key,
+            # api_mode via the runtime provider system — the same path the native
+            # delegation.provider config uses) and pin it. Without this the child
+            # inherits the parent's provider/base_url/key and a gpt-* lane 404s
+            # against api.anthropic.com. Skip credential resolution when a
+            # trusted delegation override is already in play. Fallback policy is
+            # separate below, so same-provider Codex lanes also get recovery.
+            parent_agent = kwargs.get("parent_agent")
+            parent_provider = str(getattr(parent_agent, "provider", "") or "").strip().lower()
+            target_provider = _model_provider_family(route["model"])
+            already_pinned = any(
+                kwargs.get(k) for k in (
+                    "override_provider", "override_base_url", "override_api_key",
+                    "override_api_mode", "override_acp_command", "override_acp_args",
+                )
+            )
+            if target_provider and not already_pinned and target_provider != parent_provider:
+                try:
+                    from tools.delegate_tool_config import _resolve_delegation_credentials
+                    creds = _resolve_delegation_credentials(
+                        {"provider": target_provider, "model": route["model"]}, parent_agent
+                    )
+                    kwargs["override_provider"] = creds.get("provider")
+                    kwargs["override_base_url"] = creds.get("base_url")
+                    kwargs["override_api_key"] = creds.get("api_key")
+                    kwargs["override_api_mode"] = creds.get("api_mode")
+                    if creds.get("request_overrides") is not None:
+                        kwargs["override_request_overrides"] = creds.get("request_overrides")
+                    if creds.get("command"):
+                        kwargs["override_acp_command"] = creds.get("command")
+                        kwargs["override_acp_args"] = list(creds.get("args") or [])
+                except Exception as exc:
+                    # Fail loud rather than build a child that will 404: raising a
+                    # ValueError makes delegate_task surface a tool_error so the
+                    # parent can route to the Anthropic peer explicitly.
+                    _LOG.warning(
+                        "delegate-task-routing: could not resolve provider %r for model %r: %s",
+                        target_provider, route["model"], exc,
+                    )
+                    raise ValueError(
+                        f"Cannot route lane model '{route['model']}' to provider "
+                        f"'{target_provider}': {exc}"
+                    ) from exc
+            # The route pins the child model, so the native runtime does not
+            # inherit parent fallback. Attach an approved peer independently of
+            # cross-provider credential resolution, but never invent recovery
+            # for operator-pinned credentials/transports. Explicit chains still
+            # work there after validation. [] always disables fallback.
+            kwargs["routing_cfg"] = _routed_fallback_config(
+                route["model"], allowed_models, kwargs.get("routing_cfg"),
+                automatic_peer=(target_provider == _CODEX_PROVIDER and not already_pinned),
+            )
         if "toolsets" in route:
             kwargs["toolsets"] = list(route["toolsets"])
 
@@ -541,6 +916,34 @@ def _install_patches(
                 policy_plan = _validate_delegate_against_plan(parent_agent, tasks)
             except (RuntimeError, ValueError) as exc:
                 return tool_error(str(exc))
+        if policy_plan is not None and policy_plan.get("review_task_id"):
+            # Core's live dispatcher already stripped model-hidden fields. Inject
+            # here, not in the registry handler which that dispatcher bypasses.
+            try:
+                if not isinstance(tasks, list) or len(tasks) != 1 or not isinstance(tasks[0], dict):
+                    return tool_error("development review requires exactly one reviewer task")
+                review_task = _review_task(str(getattr(parent_agent, "session_id", "") or ""), policy_plan["review_task_id"])
+                if (not review_task or not review_task.get("root")
+                        or _artifact_revision(review_task["root"]) != policy_plan["review_revision"]):
+                    return tool_error("review artifact changed before reviewer launch")
+                tasks = [dict(tasks[0])]
+                tasks[0]["goal"] = (
+                    "Independently inspect the repository at " + review_task["root"] +
+                    " and run appropriate read-only verification for the checkpoint. "
+                    "Report blocking findings; pass only if the artifact merits completion. "
+                    "The exact revision fingerprint is " + policy_plan["review_revision"] +
+                    '. Return only JSON {"verdict": "pass" or "fail", "revision": '
+                    'the exact fingerprint, "findings": a string}. '
+                    "Do not edit the artifact or perform external writes."
+                )
+                tasks[0]["output_schema"] = copy.deepcopy(_REVIEW_SCHEMA)
+                if len(args) >= 3:
+                    args = (*args[:2], tasks, *args[3:])
+                    kwargs.pop("tasks", None)
+                else:
+                    kwargs["tasks"] = tasks
+            except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+                return tool_error(str(exc))
         try:
             routes = _validate_routes(
                 tasks,
@@ -621,6 +1024,31 @@ def delegation_phase_for_turn(session_id: Any, turn_id: Any) -> str:
     return "worker"
 
 
+def delegation_lifecycle_for_turn(session_id: Any, turn_id: Any) -> dict[str, Any]:
+    """Return an authenticated, non-sensitive lifecycle view for observers.
+
+    The plan is created by this plugin only after route validation or durable
+    async-completion authentication.  Presentation plugins can therefore use
+    it without parsing user-controlled completion-marker text.  No goals,
+    labels, model names, toolsets, or result payloads are exposed.
+    """
+    with _POLICY_LOCK:
+        plan = _TURN_PLANS.get(_turn_key(session_id, turn_id))
+        if not isinstance(plan, Mapping):
+            return {"mode": "unrouted", "delegation_ids": []}
+        mode = str(plan.get("mode") or "unrouted")
+        ids: list[str] = []
+        for value in (
+            *(plan.get("owned_delegation_ids") or []),
+            plan.get("source_delegation_id"),
+            plan.get("delegation_id"),
+        ):
+            value = str(value or "").strip()
+            if value and value not in ids:
+                ids.append(value)
+        return {"mode": mode, "delegation_ids": ids, "dispatched": bool(plan.get("dispatched"))}
+
+
 def _resolve_turn_context(parent_agent: Any, kw: Mapping[str, Any]) -> tuple[str, str]:
     """Resolve (session_id, turn_id) for a tool-handler invocation.
 
@@ -645,11 +1073,36 @@ def _resolve_turn_context(parent_agent: Any, kw: Mapping[str, Any]) -> tuple[str
 
 
 def _is_enforced_parent(*, platform: Any, task_id: Any, parent_session_id: Any = "") -> bool:
-    if str(platform or "").lower() not in _ENFORCED_PLATFORMS:
+    platform_value = getattr(platform, "value", platform)
+    if str(platform_value or "").lower() not in _ENFORCED_PLATFORMS:
         return False
     if str(task_id or "").startswith("sa-") or str(parent_session_id or ""):
         return False
     return True
+
+
+def _worker_verifier_requirement(user_message: Any) -> bool | None:
+    """Classify only deterministic risk boundaries; leave ambiguous turns semantic."""
+    message = str(user_message or "")
+    if _HIGH_RISK_TURN_RE.search(message):
+        return True
+    mutation = _MUTATION_RE.search(message)
+    if mutation and _ROUTING_POLICY_RE.search(message):
+        return True
+    if _OPERATIONAL_SCOPE_RE.search(message):
+        if mutation or not _READ_ONLY_TURN_RE.search(message):
+            return True
+        return False
+    if _ORDINARY_TURN_RE.search(message) or (
+        not mutation and _READ_ONLY_TURN_RE.search(message)
+    ):
+        return False
+    return None
+
+
+def _requires_worker_verifier(user_message: Any) -> bool:
+    """Return whether this turn crosses the deterministic high-risk boundary."""
+    return _worker_verifier_requirement(user_message) is True
 
 
 def _validate_plan(
@@ -658,12 +1111,17 @@ def _validate_plan(
     allowed_models: Sequence[str],
     allowed_efforts: Sequence[str],
     allowed_toolsets: Sequence[str],
+    require_worker_verifier: bool | None = None,
 ) -> dict[str, Any]:
     mode = str(payload.get("mode") or "").strip().lower()
     reason = str(payload.get("reason") or "").strip()
     lanes = payload.get("lanes")
     if mode not in {"direct", "single", "parallel", "worker_verifier"}:
         raise ValueError("mode must be direct, single, parallel, or worker_verifier")
+    if require_worker_verifier is True and mode != "worker_verifier":
+        raise ValueError("worker_verifier is required for this high-risk turn")
+    if require_worker_verifier is False and mode == "worker_verifier":
+        raise ValueError("worker_verifier is reserved for high-risk turns")
     if not reason:
         raise ValueError("reason is required")
     if not isinstance(lanes, list):
@@ -809,7 +1267,7 @@ def _load_actual_routes(delegation_id: str) -> list[dict[str, Any]]:
         from hermes_constants import get_hermes_home
 
         db = Path(get_hermes_home()) / "state.db"
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        con = sqlite3.connect(f"file:{db}?immutable=1", uri=True)
         row = con.execute(
             "SELECT event_json FROM async_delegations WHERE delegation_id = ?",
             (delegation_id,),
@@ -847,17 +1305,118 @@ def _persist_delegation_policy(delegation_id: str, record: Mapping[str, Any]) ->
         records = _durable_delegations()
         records[delegation_id] = dict(record)
         if len(records) > 100:
-            ordered = sorted(
-                records,
+            prunable = sorted(
+                (key for key, value in records.items()
+                 if str(value.get("stage") or "") in {"workers_consumed", "verifiers_consumed", "completion_consumed", "policy_error"}),
                 key=lambda key: float(records[key].get("created_at") or 0),
             )
-            for key in ordered[:-80]:
-                records.pop(key, None)
+            while len(records) > 80 and prunable:
+                records.pop(prunable.pop(0), None)
         _PLUGIN_STATE.set("delegations", records)
     except Exception as exc:
         _LOG.warning("Could not persist orchestration state %s: %s", delegation_id, exc)
         raise RuntimeError("could not persist mandatory verification state") from exc
 
+
+def _claim_completion_once(delegation_id: str, session_id: str, turn_id: str) -> dict[str, Any] | None:
+    """Atomically reserve one authenticated completion envelope per gateway process.
+
+    The durable stage makes replays fail closed across restarts. Active worker and
+    verifier chains remain non-prunable until their continuation is dispatched or
+    their final result is consumed.
+    """
+    with _POLICY_LOCK:
+        records = _durable_delegations()
+        current = records.get(delegation_id)
+        if isinstance(current, Mapping):
+            record = dict(current)
+            if not _owned_session(str(record.get("parent_session_id") or ""), session_id):
+                return None
+            stage = str(record.get("stage") or "")
+            if stage not in {"workers_dispatched", "verifiers_dispatched"}:
+                return None
+            claimed_stage = "workers_completion_claimed" if stage == "workers_dispatched" else "verifiers_completion_claimed"
+        else:
+            record = {"parent_session_id": session_id, "created_at": time.time()}
+            stage = "ordinary"
+            claimed_stage = "completion_consumed"
+        record.update(stage=claimed_stage, claimed_turn_id=turn_id, updated_at=time.time())
+        _persist_delegation_policy(delegation_id, record)
+        record["claimed_from_stage"] = stage
+        return record
+
+
+def _mark_completion_consumed(delegation_id: str, stage: str) -> None:
+    with _POLICY_LOCK:
+        record = _durable_delegations().get(delegation_id)
+        if not isinstance(record, Mapping):
+            return
+        updated = dict(record)
+        updated.update(stage=stage, updated_at=time.time())
+        _persist_delegation_policy(delegation_id, updated)
+
+
+def _review_completion(delegation_id: str, session_id: str) -> bool:
+    """Authenticate a terminal review; malformed output fails visibly, not in a loop."""
+    with _POLICY_LOCK:
+        matches = [dict(t) for t in _review_records().values() if isinstance(t, dict)
+                   and t.get("delegation_id") == delegation_id
+                   and t.get("phase") == "review_pending"
+                   and _owned_session(t.get("session_id", ""), session_id)]
+        if len(matches) != 1:
+            return False
+        task = matches[0]
+        # The core reader includes uncheckpointed WAL frames; the plugin-owned
+        # dispatch binding above authenticates this id and owner.
+        from tools.async_delegation import get_durable_delegation
+        core = get_durable_delegation(delegation_id)
+        if (not core or core.get("delegation_id") != delegation_id
+                or core.get("state") not in {"completed", "error", "unknown"}):
+            return False
+        result_data = core.get("result") or {}
+        results = result_data.get("results") if isinstance(result_data, dict) else []
+        result = results[0] if isinstance(results, list) and len(results) == 1 and isinstance(results[0], dict) else {}
+        summary = str(result.get("summary") or "")
+
+        def failed(reason: str, findings: str = "") -> bool:
+            task.update(phase="review_failed", review_failure_reason=reason,
+                        reviewer_summary=summary[:500], findings=findings or reason,
+                        reviewed_revision=None)
+            _save_review(task)
+            return False
+
+        if (core.get("state") != "completed" or not result
+                or result.get("status") != "completed" or result.get("exit_reason") != "completed"):
+            return failed("검토가 정상적으로 끝나지 않았습니다")
+        routing = result.get("routing") or {}
+        if (not isinstance(routing, dict) or not routing.get("child_session_id")
+                or routing.get("child_session_id") == task["session_id"]
+                or routing.get("extension") != f"{PLUGIN_ID}@{PLUGIN_VERSION}"):
+            return failed("독립 검토 결과를 확인할 수 없습니다")
+        # Core already made its one bounded schema retry. Do not redispatch
+        # silently. Older schema-less results may pass only this exact contract.
+        if result.get("schema_valid") is not True and result.get("schema_valid") is not None:
+            return failed("검토 결과 형식이 올바르지 않습니다")
+        try:
+            verdict = json.loads(summary)
+        except (ValueError, TypeError):
+            return failed("검토 결과를 읽을 수 없습니다")
+        if (not isinstance(verdict, dict) or set(verdict) != set(_REVIEW_SCHEMA["required"])
+                or not all(isinstance(verdict.get(key), str) for key in _REVIEW_SCHEMA["required"])
+                or verdict.get("verdict") not in {"pass", "fail"}):
+            return failed("검토 결과 형식이 올바르지 않습니다")
+        if verdict["revision"] != task["revision"]:
+            return failed("검토 대상이 현재 작업과 다릅니다", verdict["findings"])
+        if _artifact_revision(task["root"]) != task["revision"]:
+            return failed("검토 중 작업 내용이 변경되었습니다", verdict["findings"])
+        if verdict["verdict"] == "fail":
+            return failed("검토에서 수정할 문제가 발견되었습니다", verdict["findings"])
+        task.update(phase="reviewed", reviewed_revision=task["revision"],
+                    reviewed_delegation_id=delegation_id, findings=verdict["findings"],
+                    reviewer_summary=summary[:500])
+        task.pop("review_failure_reason", None)
+        _save_review(task)
+        return True
 
 def _compression_tip(con: sqlite3.Connection, session_id: str) -> str:
     """Return only the verified compression-continuation tip."""
@@ -900,7 +1459,7 @@ def _owned_session(
         if con is None:
             from hermes_constants import get_hermes_home
             con = sqlite3.connect(
-                f"file:{Path(get_hermes_home()) / 'state.db'}?mode=ro", uri=True
+                f"file:{Path(get_hermes_home()) / 'state.db'}?immutable=1", uri=True
             )
             close = True
         return _compression_tip(con, owner) == delivery
@@ -915,11 +1474,31 @@ def _verified_completion_routes(
     delegation_id: str, session_id: str
 ) -> list[dict[str, Any]]:
     """Authenticate an async completion against the durable core ledger."""
+    # Review dispatch IDs are bound to an owned checkpoint in profile state.
+    # The core's reader sees WAL frames that immutable SQLite cannot see.
+    with _POLICY_LOCK:
+        review = [t for t in _review_records().values() if isinstance(t, dict)
+                  and t.get("delegation_id") == delegation_id
+                  and t.get("phase") == "review_pending"
+                  and _owned_session(t.get("session_id", ""), session_id)]
+    if len(review) == 1:
+        try:
+            from tools.async_delegation import get_durable_delegation
+            core = get_durable_delegation(delegation_id)
+            result = core.get("result") if core else None
+            if (core and core.get("delegation_id") == delegation_id
+                    and core.get("state") == "completed" and isinstance(result, dict)):
+                return [{**dict(entry.get("routing") or {}),
+                         "status": entry.get("status"), "completed": True}
+                        for entry in result.get("results") or [] if isinstance(entry, dict)]
+        except Exception as exc:
+            _LOG.warning("Could not authenticate review completion %s: %s", delegation_id, exc)
+        return []
     try:
         from hermes_constants import get_hermes_home
 
         db = Path(get_hermes_home()) / "state.db"
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        con = sqlite3.connect(f"file:{db}?immutable=1", uri=True)
         row = con.execute(
             "SELECT state, parent_session_id, event_json "
             "FROM async_delegations WHERE delegation_id = ?",
@@ -991,15 +1570,25 @@ def _mark_delegation_dispatch(plan: dict[str, Any], parsed: Mapping[str, Any]) -
                 {
                     "stage": "verifiers_dispatched",
                     "parent_session_id": plan.get("parent_session_id") or "",
+                    "source_delegation_id": plan.get("source_delegation_id") or "",
                     "lanes": plan.get("original_lanes") or plan.get("lanes") or [],
                     "prior_routes": plan.get("prior_routes") or [],
                     "created_at": time.time(),
                 },
             )
+            source_delegation_id = str(plan.get("source_delegation_id") or "").strip()
+            if source_delegation_id:
+                _mark_completion_consumed(source_delegation_id, "workers_consumed")
         except RuntimeError:
             plan["mode"] = "policy_error"
             plan["dispatched"] = False
             raise
+    if plan.get("review_task_id"):
+        task = _review_task(str(plan.get("parent_session_id") or ""), plan["review_task_id"])
+        if not task or _artifact_revision(task["root"]) != plan.get("review_revision"):
+            raise RuntimeError("review artifact changed during dispatch; checkpoint again")
+        task.update(phase="review_pending", delegation_id=delegation_id)
+        _save_review(task)
     plan["dispatched"] = True
 
 
@@ -1027,6 +1616,9 @@ def _pre_llm_policy(**kwargs: Any) -> Any:
         if len(_FORCED_ROUTE_COUNTS) > 500:
             for key in list(_FORCED_ROUTE_COUNTS)[:-400]:
                 _FORCED_ROUTE_COUNTS.pop(key, None)
+        if len(_TURN_RISK_REQUIREMENTS) > 500:
+            for key in list(_TURN_RISK_REQUIREMENTS)[:-400]:
+                _TURN_RISK_REQUIREMENTS.pop(key, None)
         if len(_FORCED_ROUTE_REQUESTS) > 500:
             _FORCED_ROUTE_REQUESTS.clear()
         if not enforced:
@@ -1036,13 +1628,32 @@ def _pre_llm_policy(**kwargs: Any) -> Any:
     message = str(kwargs.get("user_message") or "")
     match = _ASYNC_DELEGATION_RE.search(message)
     if not match:
-        return None
+        with _POLICY_LOCK:
+            requirement = _worker_verifier_requirement(message)
+            _TURN_RISK_REQUIREMENTS[_turn_key(session_id, turn_id)] = requirement
+            if requirement is not True and _DEV_REQUEST_RE.search(message):
+                try:
+                    if _review_task(session_id) is None:
+                        _save_review({"task_id": uuid.uuid4().hex, "session_id": session_id,
+                                      "root": None, "phase": "working", "revision": None,
+                                      "reviewed_revision": None, "review_trigger": None,
+                                      "created_at": time.time()})
+                except Exception as exc:
+                    _LOG.error("Cannot persist development review gate: %s", exc)
+                    _TURN_PLANS[_turn_key(session_id, turn_id)] = {
+                        "mode": "policy_error", "reason": "review state unavailable",
+                        "lanes": [], "dispatched": False, "created_at": time.time()}
+        return {"context": (
+            "For a development task, call development_review(begin, root=<git repository>) "
+            "after route_turn. Ordinary work and progress need no verifier. At a "
+            "meaningful milestone or before claiming completion, call checkpoint; "
+            "if not already reviewed, route_turn(single, review_task_id=<task_id>) "
+            "with an independent reviewer lane, then dispatch it. An unreviewed "
+            "turn may report progress using development_review(progress), but "
+            "cannot claim final readiness. High-risk worker_verifier remains mandatory."
+        )} if requirement is not True and _DEV_REQUEST_RE.search(message) else None
     delegation_id = match.group(1).strip()
     actual = _verified_completion_routes(delegation_id, session_id)
-    record = _durable_delegations().get(delegation_id)
-    record_matches_session = isinstance(record, Mapping) and _owned_session(
-        str(record.get("parent_session_id") or ""), session_id
-    )
     if not actual:
         with _POLICY_LOCK:
             _TURN_PLANS[_turn_key(session_id, turn_id)] = {
@@ -1061,7 +1672,22 @@ def _pre_llm_policy(**kwargs: Any) -> Any:
                 "verifiers or claim completion."
             )
         }
-    if record_matches_session and record.get("stage") == "workers_dispatched":
+    record = _claim_completion_once(delegation_id, session_id, turn_id)
+    if record is None:
+        with _POLICY_LOCK:
+            _TURN_PLANS[_turn_key(session_id, turn_id)] = {
+                "mode": "policy_error", "reason": "async completion was already consumed",
+                "lanes": [], "actual_routes": [], "dispatched": False,
+                "delegation_id": delegation_id, "created_at": time.time(),
+            }
+        return {"context": "This authenticated async completion was already consumed. Do not dispatch or answer it again."}
+    claimed_from_stage = str(record.get("claimed_from_stage") or "")
+    if _PLUGIN_STATE is not None:
+        try:
+            _review_completion(delegation_id, session_id)
+        except Exception as exc:
+            _LOG.error("Development review completion could not be authenticated: %s", exc)
+    if claimed_from_stage == "workers_dispatched":
         original_lanes = list(record.get("lanes") or [])
         verifiers = [lane for lane in original_lanes if lane.get("phase") == "verifier"]
         plan = {
@@ -1089,8 +1715,14 @@ def _pre_llm_policy(**kwargs: Any) -> Any:
                 "already recorded; call delegate_task directly."
             )
         }
-    if record_matches_session and record.get("stage") == "verifiers_dispatched":
+    if claimed_from_stage == "verifiers_dispatched":
         actual = list(record.get("prior_routes") or []) + actual
+    owned_delegation_ids = [delegation_id]
+    if claimed_from_stage == "verifiers_dispatched":
+        source_delegation_id = str(record.get("source_delegation_id") or "").strip()
+        if source_delegation_id and source_delegation_id not in owned_delegation_ids:
+            owned_delegation_ids.insert(0, source_delegation_id)
+        _mark_completion_consumed(delegation_id, "verifiers_consumed")
     with _POLICY_LOCK:
         _TURN_PLANS[_turn_key(session_id, turn_id)] = {
             "mode": "completion",
@@ -1099,6 +1731,7 @@ def _pre_llm_policy(**kwargs: Any) -> Any:
             "actual_routes": actual,
             "dispatched": True,
             "delegation_id": delegation_id,
+            "owned_delegation_ids": owned_delegation_ids,
             "created_at": time.time(),
         }
     if actual:
@@ -1150,7 +1783,7 @@ def _forced_tool_choice(name: str, api_mode: Any) -> dict[str, Any]:
     return {"type": "function", "function": {"name": name}}
 
 
-def _pin_route_turn_as_core() -> Callable[[], None] | None:
+def _pin_route_turn_as_core(name: str = "route_turn") -> Callable[[], None] | None:
     """Keep route_turn out of tool-search deferral.
 
     Tool Search treats every non-core plugin tool as deferrable and collapses
@@ -1165,7 +1798,6 @@ def _pin_route_turn_as_core() -> Callable[[], None] | None:
     already pinned, or None when the core list cannot be found (future Hermes
     layout) — in that case _route_turn_enforceable() must gate enforcement.
     """
-    name = ROUTE_TURN_SCHEMA["name"]
     try:
         import toolsets as toolsets_module
     except Exception:
@@ -1208,14 +1840,17 @@ def _route_turn_enforceable() -> bool:
         return True
 
 
-def _ensure_route_tool_declared(
-    request: dict[str, Any], api_mode: Any
+def _ensure_tool_declared(
+    request: dict[str, Any], api_mode: Any, schema: Mapping[str, Any]
 ) -> dict[str, Any]:
-    """Keep route_turn provider-visible even when tool_search defers it."""
+    """Inject one provider-native tool declaration idempotently."""
     mode = str(api_mode or "").lower()
-    name = ROUTE_TURN_SCHEMA["name"]
-    description = ROUTE_TURN_SCHEMA["description"]
-    parameters = ROUTE_TURN_SCHEMA["parameters"]
+    name = str(schema.get("name") or "").strip()
+    description = str(schema.get("description") or "")
+    parameters = schema.get("parameters")
+    if not name or not isinstance(parameters, Mapping):
+        raise RuntimeError("forced tool schema is unavailable or invalid")
+    parameters = dict(parameters)
     if mode == "bedrock_converse":
         tool_config = dict(request.get("toolConfig") or {})
         tools = list(tool_config.get("tools") or [])
@@ -1279,6 +1914,13 @@ def _ensure_route_tool_declared(
             )
     request["tools"] = tools
     return request
+
+
+def _ensure_route_tool_declared(
+    request: dict[str, Any], api_mode: Any
+) -> dict[str, Any]:
+    """Keep route_turn provider-visible even when tool_search defers it."""
+    return _ensure_tool_declared(request, api_mode, ROUTE_TURN_SCHEMA)
 
 
 def _llm_request_policy(request: dict[str, Any], **kwargs: Any) -> Any:
@@ -1359,6 +2001,11 @@ def _llm_request_policy(request: dict[str, Any], **kwargs: Any) -> Any:
         "dispatched"
     ):
         api_mode = kwargs.get("api_mode")
+        if not isinstance(_DELEGATE_TASK_REQUEST_SCHEMA, Mapping):
+            raise RuntimeError("delegate_task request schema was not retained at plugin registration")
+        rewritten = _ensure_tool_declared(
+            rewritten, api_mode, _DELEGATE_TASK_REQUEST_SCHEMA
+        )
         choice = _forced_tool_choice("delegate_task", api_mode)
         if str(api_mode or "").lower() == "bedrock_converse":
             tool_config = dict(rewritten.get("toolConfig") or {})
@@ -1465,14 +2112,47 @@ def _transform_header(response_text: str, session_id: str, model: str, **kwargs:
         detail = " · ".join(lane_parts) if lane_parts else "위임 기록 만료 · 실행경로 미검증"
         header = f"_Alex: {main} · {detail}_"
     body = _HEADER_RE.sub("", str(response_text or "")).lstrip()
+    if _PLUGIN_STATE is not None and session_id not in _SKIP_HEADER_SESSIONS:
+        try:
+            task = _review_task(session_id)
+            if task is None:
+                with _POLICY_LOCK:
+                    closed = [dict(t) for t in _review_records().values() if isinstance(t, dict)
+                              and t.get("phase") == "closed"
+                              and _owned_session(t.get("session_id", ""), session_id)]
+                    task = max(closed, key=lambda t: t.get("created_at", 0)) if closed else None
+            if task and not _review_status(task)["ready"]:
+                with _POLICY_LOCK:
+                    _PROGRESS_TURNS.discard(_turn_key(session_id, turn_id))
+                phase = task.get("phase")
+                if phase == "review_pending":
+                    status = "검토 중: 결과를 기다리고 있습니다."
+                elif phase == "review_failed":
+                    reason = " ".join(str(task.get("review_failure_reason") or "결과를 확인할 수 없습니다").split())[:120]
+                    status = f"검토 실패: {reason}. 재검토 필요."
+                elif phase == "review_due":
+                    status = "검토 대기: 작업 확인을 마쳤고 검토를 기다리고 있습니다."
+                elif phase in {"reviewed", "closed"}:
+                    status = "검토 대기: 작업 내용이 바뀌어 재검토가 필요합니다."
+                else:
+                    status = "검토 대기: 작업이 진행 중입니다."
+                if not body.startswith(status + "\n\n"):
+                    body = f"{status}\n\n{body}"
+        except Exception as exc:
+            _LOG.error("Cannot verify development review readiness: %s", exc)
+            status = "검토 실패: 검토 상태를 확인할 수 없습니다. 재검토 필요."
+            if not body.startswith(status + "\n\n"):
+                body = f"{status}\n\n{body}"
     return f"{header}\n\n{body}"
 
 
 def register(ctx) -> None:
-    global _PLUGIN_STATE
+    global _PLUGIN_STATE, _DELEGATE_TASK_REQUEST_SCHEMA
     import tools.delegate_tool as delegate_module
 
     _PLUGIN_STATE = ctx.state
+    if _PLUGIN_STATE is None or not all(callable(getattr(_PLUGIN_STATE, method, None)) for method in ("get", "set")):
+        raise RuntimeError("profile-scoped development review state is unavailable")
 
     if _native_has_full_routing(delegate_module):
         _LOG.info(
@@ -1506,6 +2186,7 @@ def register(ctx) -> None:
             allowed_efforts=allowed_efforts,
             allowed_toolsets=allowed_toolsets,
         )
+        _DELEGATE_TASK_REQUEST_SCHEMA = copy.deepcopy(schema)
 
         def route_handler(args: dict[str, Any], **kw: Any):
             parent_agent = kw.get("parent_agent")
@@ -1546,7 +2227,19 @@ def register(ctx) -> None:
                     allowed_models=allowed_models,
                     allowed_efforts=allowed_efforts,
                     allowed_toolsets=allowed_toolsets,
+                    require_worker_verifier=_TURN_RISK_REQUIREMENTS.get(guard_key),
                 )
+                review_id = str(args.get("review_task_id") or "")
+                if review_id:
+                    if plan["mode"] != "single" or _TURN_RISK_REQUIREMENTS.get(guard_key) is True:
+                        raise ValueError("development review requires single mode; high-risk worker_verifier cannot be bypassed")
+                    review_task = _review_task(guard_session_id, review_id)
+                    if not review_task or review_task.get("phase") != "review_due" or not review_task.get("root"):
+                        raise ValueError("owned development checkpoint is not review_due")
+                    revision = _artifact_revision(review_task["root"])
+                    if revision != review_task.get("revision"):
+                        raise ValueError("artifact changed since checkpoint; checkpoint again")
+                    plan.update(review_task_id=review_id, review_revision=revision)
                 parent_sets = set(getattr(parent_agent, "enabled_toolsets", None) or [])
                 for index, lane in enumerate(plan["lanes"]):
                     if parent_sets and not set(lane["toolsets"]).issubset(parent_sets):
@@ -1608,7 +2301,6 @@ def register(ctx) -> None:
             action = str(args.get("action") or "").strip().lower()
             parent_agent = kw.get("parent_agent")
             tasks = delegate_module._strip_model_hidden_task_fields(args.get("tasks"))
-            plan = None
             enforce_plan = (
                 parent_agent is not None
                 and getattr(parent_agent, "_delegate_depth", 0) == 0
@@ -1617,12 +2309,14 @@ def register(ctx) -> None:
             )
             if action not in {"list", "steer", "stop"} and enforce_plan:
                 try:
-                    plan = _validate_delegate_against_plan(parent_agent, tasks)
+                    _validate_delegate_against_plan(parent_agent, tasks)
                 except (RuntimeError, ValueError) as exc:
                     from tools.registry import tool_error
 
                     return tool_error(str(exc))
-            result = delegate_module.delegate_task(
+            # Injection and dispatch bookkeeping belong to the patched core
+            # entrypoint; both registry and live-dispatch calls use it.
+            return delegate_module.delegate_task(
                 goal=args.get("goal"),
                 context=args.get("context"),
                 tasks=tasks,
@@ -1637,16 +2331,6 @@ def register(ctx) -> None:
                 message=args.get("message"),
                 parent_agent=parent_agent,
             )
-            if plan is not None:
-                try:
-                    parsed_result = json.loads(result) if isinstance(result, str) else result
-                except (TypeError, json.JSONDecodeError):
-                    parsed_result = {}
-                if isinstance(parsed_result, Mapping):
-                    with _POLICY_LOCK:
-                        _mark_delegation_dispatch(plan, parsed_result)
-                return result
-            return result
 
         route_registration = ctx.register_tool(
             name="route_turn",
@@ -1659,12 +2343,27 @@ def register(ctx) -> None:
         if route_registration is None:
             raise RuntimeError("failed to register route_turn")
 
+        review_schema = {
+            "name": "development_review",
+            "description": "Durable task-level review gate for reversible local development. Begin with git root; checkpoint at milestone/completion, progress or status without review, ready only after independent review of exact revision. High-risk routing remains worker_verifier.",
+            "parameters": {"type": "object", "properties": {
+                "action": {"type": "string", "enum": ["begin", "checkpoint", "progress", "status", "ready", "close"]},
+                "root": {"type": "string"}, "task_id": {"type": "string"},
+                "trigger": {"type": "string", "enum": ["milestone", "completion"]},
+            }, "required": ["action"]},
+        }
+        if ctx.register_tool(name="development_review", toolset="delegation", schema=review_schema,
+                             handler=_review_action, description=review_schema["description"], emoji="🔍") is None:
+            raise RuntimeError("failed to register development_review")
+        review_unpin = _pin_route_turn_as_core("development_review")
         core_unpin = _pin_route_turn_as_core()
         if core_unpin is not None:
             base_unload = unload
 
             def _unload_with_unpin() -> None:
                 core_unpin()
+                if review_unpin is not None:
+                    review_unpin()
                 base_unload()
 
             unload = _unload_with_unpin

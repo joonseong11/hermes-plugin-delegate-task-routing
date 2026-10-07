@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import sqlite3
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -40,6 +41,12 @@ def base_schema():
             },
         },
     }
+
+
+@pytest.fixture(autouse=True)
+def retained_delegate_request_schema(monkeypatch):
+    """Model the schema retained by register() for middleware-only unit tests."""
+    monkeypatch.setattr(plugin, "_DELEGATE_TASK_REQUEST_SCHEMA", base_schema())
 
 
 class FakeChild:
@@ -130,6 +137,11 @@ def settings(key, default=None):
             "gpt-5.6-terra-900k",
             "gpt-5.6-sol-900k",
             "gpt-6-astra",
+            "gpt-6.1-sol",
+            "gpt-6-luna",
+            "claude-opus-4-8",
+            "claude-fable-5.1",
+            "claude-sonnet-5",
         ],
         "allowed_reasoning_efforts": ["low", "medium", "high", "xhigh", "max"],
         "allowed_toolsets": ["web", "file", "terminal", "code_execution", "reader_db"],
@@ -300,6 +312,126 @@ def test_native_post_build_toolset_broadening_fails_closed():
         unload()
 
 
+def anthropic_parent():
+    """Parent running on anthropic (e.g. claude-opus) — the real gateway state
+    that makes a gpt-* lane cross-provider."""
+    return SimpleNamespace(
+        model="claude-opus-4-8",
+        provider="anthropic",
+        enabled_toolsets=["web", "file", "terminal", "code_execution", "reader_db"],
+        reasoning_config={"enabled": True, "effort": "medium"},
+    )
+
+
+def _install_capturing_creds(monkeypatch):
+    """Make the plugin's cross-provider credential resolution hermetic: return a
+    fixed codex bundle instead of hitting the live provider system."""
+    import types
+
+    fake_bundle = {
+        "model": None,
+        "provider": "openai-codex",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api_key": "codex-key",
+        "api_mode": "codex_responses",
+        "request_overrides": {},
+    }
+
+    def fake_resolve(cfg, parent_agent):
+        out = dict(fake_bundle)
+        out["model"] = cfg.get("model")
+        return out
+
+    fake_mod = types.ModuleType("tools.delegate_tool_config")
+    fake_mod._resolve_delegation_credentials = fake_resolve
+    monkeypatch.setitem(sys.modules, "tools.delegate_tool_config", fake_mod)
+
+
+def test_cross_provider_lane_pins_provider_and_fallback(monkeypatch):
+    """A gpt-* lane on an anthropic parent must pin openai-codex creds AND get an
+    Anthropic-peer fallback chain, instead of inheriting anthropic and 404ing."""
+    _install_capturing_creds(monkeypatch)
+    module = fake_module()
+    captured = {}
+    original_builder = module._build_child_preserving_parent_tools
+
+    def capturing_builder(*args, **kwargs):
+        captured.update(kwargs)
+        return original_builder(*args, **kwargs)
+
+    module._build_child_preserving_parent_tools = capturing_builder
+    unload = plugin._install_patches(module, get_config=settings)
+    try:
+        module.delegate_task(
+            tasks=[routed_task(model="gpt-6.1-sol", effort="high", toolsets=["file"])],
+            parent_agent=anthropic_parent(),
+        )
+        assert captured.get("override_provider") == "openai-codex"
+        assert captured.get("override_base_url") == "https://chatgpt.com/backend-api/codex"
+        assert captured.get("override_api_key") == "codex-key"
+        assert captured.get("override_api_mode") == "codex_responses"
+        chain = (captured.get("routing_cfg") or {}).get("fallback_providers")
+        assert chain == [{"provider": "anthropic", "model": "claude-opus-4-8"}]
+    finally:
+        unload()
+
+
+def test_cross_provider_fallback_peer_matches_tier(monkeypatch):
+    """Luna→Sonnet, Sol→Opus, Astra→Fable; no generation-prefix escalation."""
+    _install_capturing_creds(monkeypatch)
+    for lane_model, expected_peer in (
+        ("gpt-6.1-sol", "claude-opus-4-8"),
+        ("gpt-6-astra", "claude-fable-5.1"),
+        ("gpt-6-luna", "claude-sonnet-5"),
+    ):
+        module = fake_module()
+        captured = {}
+        original_builder = module._build_child_preserving_parent_tools
+
+        def capturing_builder(*args, __cap=captured, __orig=original_builder, **kwargs):
+            __cap.update(kwargs)
+            return __orig(*args, **kwargs)
+
+        module._build_child_preserving_parent_tools = capturing_builder
+        unload = plugin._install_patches(module, get_config=settings)
+        try:
+            module.delegate_task(
+                tasks=[routed_task(model=lane_model, effort="high", toolsets=["file"])],
+                parent_agent=anthropic_parent(),
+            )
+            chain = (captured.get("routing_cfg") or {}).get("fallback_providers")
+            assert chain == [{"provider": "anthropic", "model": expected_peer}], lane_model
+        finally:
+            unload()
+
+
+def test_same_provider_lane_does_not_override(monkeypatch):
+    """When the parent already runs openai-codex, a gpt-* lane must NOT inject an
+    override_provider, but approved fallback must still be available."""
+    _install_capturing_creds(monkeypatch)
+    module = fake_module()
+    captured = {}
+    original_builder = module._build_child_preserving_parent_tools
+
+    def capturing_builder(*args, **kwargs):
+        captured.update(kwargs)
+        return original_builder(*args, **kwargs)
+
+    module._build_child_preserving_parent_tools = capturing_builder
+    unload = plugin._install_patches(module, get_config=settings)
+    try:
+        module.delegate_task(
+            tasks=[routed_task(model="gpt-6-luna", effort="high", toolsets=["file"])],
+            parent_agent=parent(),  # provider="openai-codex"
+        )
+        assert not captured.get("override_provider")
+        assert captured["routing_cfg"]["fallback_providers"] == [
+            {"provider": "anthropic", "model": "claude-sonnet-5"}
+        ]
+    finally:
+        unload()
+
+
 def test_routed_orchestrator_role_is_rejected():
     module = fake_module()
     unload = plugin._install_patches(module, get_config=settings)
@@ -426,6 +558,76 @@ def test_route_plan_modes_and_worker_verifier_phases():
         allowed_toolsets=settings("allowed_toolsets"),
     )
     assert {lane["phase"] for lane in plan["lanes"]} == {"worker", "verifier"}
+
+
+def test_worker_verifier_is_forced_only_at_the_high_risk_boundary():
+    ordinary = (
+        "Summarize these local notes and update a draft.",
+        "로컬 코드 수정 후 테스트를 실행해줘",
+    )
+    high_risk = (
+        "Write the approved update to the external system.",
+        "Handle the deployments.",
+        "Change production configuration.",
+        "Transfer funds.",
+        "Complete the accounting close.",
+        "Review this legal decision.",
+        "Perform a security change.",
+        "Change the team permissions.",
+        "Perform this irreversible action.",
+        "This ambiguous task has high error cost.",
+        "외부 시스템에 변경 사항을 기록해줘.",
+        "프로덕션 배포 전 독립 검증을 해줘",
+        "Publish the approved response to the external channel",
+    )
+    assert all(plugin._worker_verifier_requirement(text) is False for text in ordinary)
+    assert all(plugin._worker_verifier_requirement(text) is True for text in high_risk)
+    assert plugin._worker_verifier_requirement("Handle this unusual sensitive change carefully.") is None
+
+    direct = {"mode": "direct", "reason": "routine", "lanes": []}
+    with pytest.raises(ValueError, match="required for this high-risk"):
+        plugin._validate_plan(
+            direct,
+            allowed_models=settings("allowed_models"),
+            allowed_efforts=settings("allowed_reasoning_efforts"),
+            allowed_toolsets=settings("allowed_toolsets"),
+            require_worker_verifier=True,
+        )
+
+    worker = {
+        "label": "작업",
+        "phase": "worker",
+        "model": "gpt-5.6-terra-900k",
+        "reasoning_effort": "high",
+        "toolsets": ["file"],
+    }
+    verifier = {
+        "label": "검수",
+        "phase": "verifier",
+        "model": "gpt-5.6-sol-900k",
+        "reasoning_effort": "high",
+        "toolsets": ["file"],
+    }
+    worker_verifier = {
+        "mode": "worker_verifier",
+        "reason": "production deployment",
+        "lanes": [worker, verifier],
+    }
+    assert plugin._validate_plan(
+        worker_verifier,
+        allowed_models=settings("allowed_models"),
+        allowed_efforts=settings("allowed_reasoning_efforts"),
+        allowed_toolsets=settings("allowed_toolsets"),
+        require_worker_verifier=True,
+    )["mode"] == "worker_verifier"
+    with pytest.raises(ValueError, match="reserved for high-risk"):
+        plugin._validate_plan(
+            worker_verifier,
+            allowed_models=settings("allowed_models"),
+            allowed_efforts=settings("allowed_reasoning_efforts"),
+            allowed_toolsets=settings("allowed_toolsets"),
+            require_worker_verifier=False,
+        )
 
 
 def test_llm_request_policy_forces_route_then_delegate():
@@ -676,6 +878,15 @@ def test_worker_verifier_is_sequenced_across_async_completions(monkeypatch):
     verify_plan = plugin._TURN_PLANS[plugin._turn_key("parent", "verify-turn")]
     assert verify_plan["mode"] == "verification"
     assert verify_plan["expected_lanes"] == [verifier]
+    assert plugin.delegation_lifecycle_for_turn("parent", "verify-turn") == {
+        "mode": "verification", "delegation_ids": ["deleg-workers"], "dispatched": False,
+    }
+    plugin._pre_llm_policy(
+        session_id="parent", turn_id="replayed-worker", task_id="parent-task",
+        platform="slack", parent_session_id="",
+        user_message="[ASYNC DELEGATION BATCH COMPLETE — deleg-workers]",
+    )
+    assert plugin._TURN_PLANS[plugin._turn_key("parent", "replayed-worker")]["mode"] == "policy_error"
     forced = plugin._llm_request_policy(
         {"input": []},
         session_id="parent",
@@ -699,6 +910,46 @@ def test_worker_verifier_is_sequenced_across_async_completions(monkeypatch):
     final_plan = plugin._TURN_PLANS[plugin._turn_key("parent", "final-turn")]
     assert final_plan["mode"] == "completion"
     assert [x["label"] for x in final_plan["actual_routes"]] == ["구현", "기술검수"]
+    assert final_plan["owned_delegation_ids"] == ["deleg-workers", "deleg-verifiers"]
+    assert plugin.delegation_lifecycle_for_turn("parent", "final-turn") == {
+        "mode": "completion",
+        "delegation_ids": ["deleg-workers", "deleg-verifiers"],
+        "dispatched": True,
+    }
+    plugin._pre_llm_policy(
+        session_id="parent", turn_id="replayed-verifier", task_id="parent-task",
+        platform="slack", parent_session_id="",
+        user_message="[ASYNC DELEGATION BATCH COMPLETE — deleg-verifiers]",
+    )
+    assert plugin._TURN_PLANS[plugin._turn_key("parent", "replayed-verifier")]["mode"] == "policy_error"
+
+
+def test_lifecycle_contract_does_not_expose_route_payloads():
+    platform = type("PlatformValue", (), {"value": "slack"})()
+    assert plugin._is_enforced_parent(platform=platform, task_id="parent", parent_session_id="")
+    with plugin._POLICY_LOCK:
+        plugin._TURN_PLANS[plugin._turn_key("observer", "turn")] = {
+            "mode": "parallel", "delegation_id": "deleg-safe", "dispatched": True,
+            "reason": "secret reason", "lanes": [{"goal": "secret goal", "model": "secret model"}],
+        }
+    assert plugin.delegation_lifecycle_for_turn("observer", "turn") == {
+        "mode": "parallel", "delegation_ids": ["deleg-safe"], "dispatched": True,
+    }
+
+
+def test_retention_never_prunes_live_verification_chains():
+    plugin._PLUGIN_STATE = FakeState()
+    live = {
+        f"live-{index}": {"stage": "workers_dispatched", "parent_session_id": "parent", "created_at": index}
+        for index in range(101)
+    }
+    plugin._PLUGIN_STATE.set("delegations", live)
+    plugin._persist_delegation_policy(
+        "consumed", {"stage": "completion_consumed", "parent_session_id": "parent", "created_at": -1},
+    )
+    saved = dict(plugin._PLUGIN_STATE.get("delegations", {}) or {})
+    assert all(f"live-{index}" in saved for index in range(101))
+    assert "consumed" not in saved
 
 
 @pytest.mark.parametrize(
@@ -1181,10 +1432,10 @@ def test_schema_prefers_direct_over_trivial_delegation_and_limits_astra():
     desc = plugin.ROUTE_TURN_SCHEMA["description"]
     assert "never delegate a question you can answer immediately" in desc
     assert "uncertain about RISK" in desc
-    assert "Astra at xhigh/max only for the most complex" in desc
-    assert "ambiguous multi-domain synthesis, architecture, long-context integration" in desc
+    assert "Astra) at xhigh/max is reserved for exceptional architecture" in desc
+    assert "extreme long-context integration, not routine work" in desc
     assert "Do not assign Astra when a lower model can safely complete the work" in desc
-    assert "Astra does not replace Sol's independent high-risk verification" in desc
+    assert "Astra does not replace Opus's independent critical verification" in desc
 
 
 def test_delegation_phase_contract_exposes_only_verifier_state():
@@ -1258,3 +1509,28 @@ def test_policy_error_uses_precise_unverified_label():
     out=plugin._transform_header("본문",sid,"gpt-5.6-sol-900k",turn_id="turn")
     assert "위임 기록 만료 · 실행경로 미검증" in out
     assert "실행정보 확인 실패" not in out
+
+
+def test_routine_work_guidance_preserves_worker_verifier_boundary():
+    description = plugin.ROUTE_TURN_SCHEMA["description"]
+    assert "Ordinary local analysis, research" in description
+    assert "reversible file edits use direct, single, or parallel" in description
+    assert "external writes (send/post/publish/submit)" in description
+    assert "Do not select worker_verifier for routine work" in description
+
+
+def test_skill_refresh_uses_direct_before_reclassifying_work():
+    description = plugin.ROUTE_TURN_SCHEMA["description"]
+    assert "skill refresh" in description
+    assert "route_turn again before any write" in description
+
+
+def test_localized_direct_route_allows_skill_read_and_final_verification(monkeypatch):
+    monkeypatch.setattr(plugin, "_ENFORCED_PLATFORMS", {"slack"})
+    key = plugin._turn_key("localized-figma-test", "turn-local")
+    monkeypatch.setitem(plugin._TURN_PLANS, key, {"mode": "direct", "lanes": [], "dispatched": False})
+    context = dict(session_id="localized-figma-test", turn_id="turn-local",
+                   task_id="parent-task", platform="slack")
+    for tool in ("skill_view", "mcp__figma__use_figma", "mcp__figma__get_screenshot"):
+        assert plugin._pre_tool_policy(tool, **context) is None
+    assert plugin._llm_request_policy({"messages": []}, api_mode="chat_completions", **context) is None

@@ -2,6 +2,47 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.2] - 2026-10-07
+
+### Fixed
+
+- Inject the read-only reviewer goal and per-task JSON output contract in the patched native `delegate_task` entrypoint used by the live core dispatcher, with a pre-launch artifact revision recheck. The registry handler no longer duplicates injection or dispatch bookkeeping.
+- Record terminal malformed/failed reviews as `review_failed`, with a short reason, findings and a reviewer summary capped at 500 characters, instead of silently cycling back to `review_due`. Accept authenticated schema-less results only when they match the exact verdict JSON contract and revision. Failed reviews still do not grant completion readiness; checkpoint explicitly to retry.
+- Preserve assistant messages and progress updates, prepending one short Korean review status line. Readiness-check exceptions also preserve the body. Existing routing header format is unchanged.
+
+### Tests
+
+- Added regressions through the patched core entrypoint (not just the registry), plus schema coercion, pre-launch revision changes, failed verdict/malformed output, strict schema-less acceptance, body-preserving status/errors.
+- No gateway restart or Hermes core changes; live Slack activation remains pending.
+
+## [0.3.1] - Unreleased (local)
+
+- Added profile-scoped development task review checkpoints, exact git-tree fingerprints, independent single-lane review verdict authenticated from the core async ledger, safe progress and fail-closed final-output readiness for scoped Slack development tasks. Reviewed revisions are reused; later changes invalidate readiness. High-risk worker/verifier routing remains mandatory.
+- Added hermetic review-gate contracts and a self-deployment refusal for installations where the git checkout is the live plugin directory. Gateway activation and platform smoke testing remain pending.
+
+## [0.3.0] - Unreleased (local)
+
+### Changed
+
+- Default model roster is exactly Opus 4.8, Fable 5.1, GPT-6 Astra, Sol, Luna and Sonnet 5. Guidance assigns Luna simple work, Sol general work (unchanged delegation default), Sonnet the general/medium Claude alternative, Opus critical independent verification/Codex recovery, Astra exceptional architecture, and Fable extreme long context. Existing direct/single/parallel/worker_verifier risk policy is unchanged.
+- Cross-provider routed lanes resolve the target provider's complete credential bundle instead of inheriting the wrong endpoint. Automatic recovery is now independent of that resolution and also covers same-provider Codex parent/child routes.
+- Exact recovery map: GPT-6 Luna→Sonnet, Sol→Opus, Astra→Fable. Sonnet is explicitly authorized as the sixth model and supplies cost-appropriate Luna outage recovery. Unknown IDs have no guessed peer; absent peers disable automatic fallback.
+- Explicit fallback chains must use allowlisted models and matching native providers. Malformed or unauthorized chains fail closed; explicit disable and trusted credential/transport overrides are respected without shared-config mutation.
+- Local manifest/documentation version aligned with the existing 0.3.0 code. No external release or gateway restart; fresh live schema/actual-route verification remains pending operator activation.
+
+### Tests
+
+- Added focused roster, exact-peer, same/cross-provider recovery, allowlist, trusted-override, native-chain normalization and risk-policy regressions.
+
+## [0.2.9] - 2026-09-21
+
+### Added
+
+- An authenticated, non-sensitive `delegation_lifecycle_for_turn` observer contract.
+- Worker/verifier completion-chain ownership so presentation plugins finalize only the delegations owned by the authenticated completion turn.
+- Durable one-time completion claims reject replayed envelopes, and retention prunes only consumed terminal records so live mandatory-verification chains cannot disappear.
+- `route_turn` guidance now documents `claude-opus-4-8`, `claude-sonnet-5`, and `claude-fable-5.1` (anthropic) as selectable child lanes: sonnet-5 as a Terra-class general lane, opus-4-8 as a Sol-class high-quality/high-risk lane, and fable-5.1 (1M context) as an Astra-class very-large-context lane. Claude lanes are the preferred stable path when codex-family lanes are rate-limited (HTTP 429) or slow to first token. Operators must also list each model in the `allowed_models` setting for it to be selectable.
+
 ## [0.2.8] - 2026-09-09
 
 ### Fixed
