@@ -169,24 +169,10 @@ def _review_records() -> dict[str, dict[str, Any]]:
         raise RuntimeError("invalid development review state")
     return records
 
-_REVIEW_MAX_AGE_SECONDS = 72 * 60 * 60
-
-
-def _review_expired(task: Mapping[str, Any]) -> bool:
-    try:
-        return time.time() - float(task["created_at"]) > _REVIEW_MAX_AGE_SECONDS
-    except (KeyError, TypeError, ValueError):
-        return False
-
-
 def _save_review(task: dict[str, Any]) -> None:
     with _POLICY_LOCK:
         records = dict(_review_records())
         records[task["task_id"]] = task
-        for task_id, record in list(records.items()):
-            if isinstance(record, dict) and record.get("phase") != "closed" and _review_expired(record):
-                records[task_id] = {**record, "phase": "closed", "closed_reason": "stale",
-                                    "closed_at": time.time()}
         if len(records) > 100:
             closed = sorted((t for t in records.values() if isinstance(t, dict) and t.get("phase") == "closed"),
                             key=lambda t: t.get("created_at", 0))
@@ -200,10 +186,10 @@ def _review_task(session_id: str, task_id: str = "") -> dict[str, Any] | None:
         records = _review_records()
         if task_id:
             task = records.get(task_id)
-            return (dict(task) if isinstance(task, dict) and not _review_expired(task)
+            return (dict(task) if isinstance(task, dict)
                     and _owned_session(task.get("session_id", ""), session_id) else None)
         candidates = [dict(t) for t in records.values() if isinstance(t, dict)
-                      and t.get("phase") != "closed" and not _review_expired(t)
+                      and t.get("phase") != "closed"
                       and _owned_session(t.get("session_id", ""), session_id)]
         return max(candidates, key=lambda t: t.get("created_at", 0)) if candidates else None
 
@@ -1375,7 +1361,7 @@ def _review_completion(delegation_id: str, session_id: str) -> bool:
     with _POLICY_LOCK:
         matches = [dict(t) for t in _review_records().values() if isinstance(t, dict)
                    and t.get("delegation_id") == delegation_id
-                   and t.get("phase") == "review_pending" and not _review_expired(t)
+                   and t.get("phase") == "review_pending"
                    and _owned_session(t.get("session_id", ""), session_id)]
         if len(matches) != 1:
             return False
@@ -2132,7 +2118,7 @@ def _transform_header(response_text: str, session_id: str, model: str, **kwargs:
             if task is None:
                 with _POLICY_LOCK:
                     closed = [dict(t) for t in _review_records().values() if isinstance(t, dict)
-                              and t.get("phase") == "closed" and not _review_expired(t)
+                              and t.get("phase") == "closed"
                               and _owned_session(t.get("session_id", ""), session_id)]
                     task = max(closed, key=lambda t: t.get("created_at", 0)) if closed else None
             if task and not _review_status(task)["ready"]:

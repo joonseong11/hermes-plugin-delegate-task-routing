@@ -9,11 +9,10 @@ All notable changes to this project are documented here.
 - Inject the read-only reviewer goal and per-task JSON output contract in the patched native `delegate_task` entrypoint used by the live core dispatcher, with a pre-launch artifact revision recheck. The registry handler no longer duplicates injection or dispatch bookkeeping.
 - Record terminal malformed/failed reviews as `review_failed`, with a short reason, findings and a reviewer summary capped at 500 characters, instead of silently cycling back to `review_due`. Accept authenticated schema-less results only when they match the exact verdict JSON contract and revision. Failed reviews still do not grant completion readiness; checkpoint explicitly to retry.
 - Preserve assistant messages and progress updates, prepending one short Korean review status line. Readiness-check exceptions also preserve the body. Existing routing header format is unchanged.
-- Ignore review records older than 72 hours and auto-close them on the next review save, so stale tasks cannot hold later turns hostage.
 
 ### Tests
 
-- Added regressions through the patched core entrypoint (not just the registry), plus schema coercion, pre-launch revision changes, failed verdict/malformed output, strict schema-less acceptance, body-preserving status/errors and stale-task expiry.
+- Added regressions through the patched core entrypoint (not just the registry), plus schema coercion, pre-launch revision changes, failed verdict/malformed output, strict schema-less acceptance, body-preserving status/errors.
 - No gateway restart or Hermes core changes; live Slack activation remains pending.
 
 ## [0.3.1] - Unreleased (local)

@@ -395,49 +395,6 @@ def test_readiness_exception_preserves_body(registered_plugin, tmp_path, monkeyp
     assert "재검토 필요" in response
 
 
-@pytest.mark.parametrize("phase", ["working", "review_due", "review_pending", "review_failed", "reviewed"])
-def test_stale_review_ignored_then_auto_closed_on_next_save(registered_plugin, tmp_path, monkeypatch, phase):
-    ctx = registered_plugin
-    root = repo(tmp_path)
-    task_id = active(ctx, root)
-    now = plugin.time.time()
-    task = plugin._review_task("owner", task_id)
-    task.update(phase=phase, created_at=now - plugin._REVIEW_MAX_AGE_SECONDS - 1)
-    ctx.state.data["development_reviews"][task_id] = copy.deepcopy(task)
-    ctx.state.data["delegations"] = {"untouched": {"stage": "workers_dispatched"}}
-    monkeypatch.setattr(plugin.time, "time", lambda: now)
-    # Neither implicit nor explicit lookups, nor headers, inspect expired roots.
-    assert plugin._review_task("owner") is None
-    assert plugin._review_task("owner", task_id) is None
-    def no_snapshot(*args):
-        raise AssertionError("expired artifact must not be read")
-    with monkeypatch.context() as scoped:
-        scoped.setattr(plugin, "_artifact_revision", no_snapshot)
-        response = plugin._transform_header("원래 내용", "owner", "gpt-6.1-sol", turn_id="turn-1")
-        assert response.endswith("원래 내용") and "검토 대기" not in response
-    assert ctx.state.data["development_reviews"][task_id]["phase"] == phase  # read has no write side effect
-    fresh_id = invoke(ctx, "owner", "turn-1", "begin", root=str(root))["task_id"]
-    assert fresh_id != task_id
-    closed = ctx.state.data["development_reviews"][task_id]
-    assert closed == {**task, "phase": "closed", "closed_reason": "stale", "closed_at": now}
-    assert ctx.state.data["delegations"] == {"untouched": {"stage": "workers_dispatched"}}
-    # Closed stale records must not re-enter the header via its closed-task fallback.
-    fresh = plugin._review_task("owner", fresh_id)
-    fresh.update(session_id="another-owner")
-    plugin._save_review(fresh)
-    response = plugin._transform_header("새 응답", "owner", "gpt-6.1-sol", turn_id="turn-1")
-    assert response.endswith("새 응답") and "검토 대기" not in response
-
-
-def test_review_expiry_boundary(registered_plugin, tmp_path, monkeypatch):
-    task_id = active(registered_plugin, repo(tmp_path))
-    created = plugin._review_task("owner", task_id)["created_at"]
-    monkeypatch.setattr(plugin.time, "time", lambda: created + plugin._REVIEW_MAX_AGE_SECONDS)
-    assert plugin._review_task("owner", task_id) is not None
-    monkeypatch.setattr(plugin.time, "time", lambda: created + plugin._REVIEW_MAX_AGE_SECONDS + 1)
-    assert plugin._review_task("owner", task_id) is None
-
-
 def test_core_review_rechecks_revision_before_launch(captured_core_entrypoint, tmp_path):
     import tools.delegate_tool as native
     ctx, captured = captured_core_entrypoint
