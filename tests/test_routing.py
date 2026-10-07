@@ -139,7 +139,7 @@ def settings(key, default=None):
             "gpt-6-astra",
             "gpt-6.1-sol",
             "gpt-6-luna",
-            "claude-opus-4-8",
+            "claude-opus-5",
             "claude-fable-5.1",
             "claude-sonnet-5",
         ],
@@ -316,7 +316,7 @@ def anthropic_parent():
     """Parent running on anthropic (e.g. claude-opus) — the real gateway state
     that makes a gpt-* lane cross-provider."""
     return SimpleNamespace(
-        model="claude-opus-4-8",
+        model="claude-opus-5",
         provider="anthropic",
         enabled_toolsets=["web", "file", "terminal", "code_execution", "reader_db"],
         reasoning_config={"enabled": True, "effort": "medium"},
@@ -340,6 +340,9 @@ def _install_capturing_creds(monkeypatch):
     def fake_resolve(cfg, parent_agent):
         out = dict(fake_bundle)
         out["model"] = cfg.get("model")
+        if cfg.get("provider") == "anthropic":
+            out.update(provider="anthropic", base_url="https://api.anthropic.com",
+                       api_key="anthropic-key", api_mode="anthropic_messages")
         return out
 
     fake_mod = types.ModuleType("tools.delegate_tool_config")
@@ -349,7 +352,7 @@ def _install_capturing_creds(monkeypatch):
 
 def test_cross_provider_lane_pins_provider_and_fallback(monkeypatch):
     """A gpt-* lane on an anthropic parent must pin openai-codex creds AND get an
-    Anthropic-peer fallback chain, instead of inheriting anthropic and 404ing."""
+    Ordered cross-provider fallback chain, instead of inheriting anthropic and 404ing."""
     _install_capturing_creds(monkeypatch)
     module = fake_module()
     captured = {}
@@ -371,19 +374,21 @@ def test_cross_provider_lane_pins_provider_and_fallback(monkeypatch):
         assert captured.get("override_api_key") == "codex-key"
         assert captured.get("override_api_mode") == "codex_responses"
         chain = (captured.get("routing_cfg") or {}).get("fallback_providers")
-        assert chain == [{"provider": "anthropic", "model": "claude-opus-4-8"}]
+        assert chain == [
+            {"provider": "openai-codex", "model": "gpt-6-sol"},
+            {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+            {"provider": "openai-codex", "model": "gpt-6-luna"},
+            {"provider": "anthropic", "model": "claude-opus-5"},
+            {"provider": "anthropic", "model": "claude-sonnet-5"},
+        ]
     finally:
         unload()
 
 
-def test_cross_provider_fallback_peer_matches_tier(monkeypatch):
-    """Luna→Sonnet, Sol→Opus, Astra→Fable; no generation-prefix escalation."""
+def test_cross_provider_fallback_chain_matches_order(monkeypatch):
+    """Ordered recovery suffixes; Astra intentionally has no implicit fallback."""
     _install_capturing_creds(monkeypatch)
-    for lane_model, expected_peer in (
-        ("gpt-6.1-sol", "claude-opus-4-8"),
-        ("gpt-6-astra", "claude-fable-5.1"),
-        ("gpt-6-luna", "claude-sonnet-5"),
-    ):
+    for lane_model in ("gpt-6.1-sol", "gpt-6-astra", "gpt-6-luna"):
         module = fake_module()
         captured = {}
         original_builder = module._build_child_preserving_parent_tools
@@ -400,7 +405,13 @@ def test_cross_provider_fallback_peer_matches_tier(monkeypatch):
                 parent_agent=anthropic_parent(),
             )
             chain = (captured.get("routing_cfg") or {}).get("fallback_providers")
-            assert chain == [{"provider": "anthropic", "model": expected_peer}], lane_model
+            expected_models = {
+                "gpt-6.1-sol": ["gpt-6-sol", "gpt-5.6-sol", "gpt-6-luna", "claude-opus-5", "claude-sonnet-5"],
+                "gpt-6-luna": ["claude-opus-5", "claude-sonnet-5"],
+                "gpt-6-astra": [],
+            }[lane_model]
+            assert chain == [{"provider": "openai-codex" if m.startswith("gpt-") else "anthropic",
+                              "model": m} for m in expected_models]
         finally:
             unload()
 
@@ -426,7 +437,8 @@ def test_same_provider_lane_does_not_override(monkeypatch):
         )
         assert not captured.get("override_provider")
         assert captured["routing_cfg"]["fallback_providers"] == [
-            {"provider": "anthropic", "model": "claude-sonnet-5"}
+            {"provider": "anthropic", "model": "claude-opus-5"},
+            {"provider": "anthropic", "model": "claude-sonnet-5"},
         ]
     finally:
         unload()
@@ -535,15 +547,15 @@ def test_route_plan_modes_and_worker_verifier_phases():
     assert direct["mode"] == "direct"
     worker = {
         "label": "작업",
-        "phase": "worker",
+        "phase": "worker", "work_type": "mechanical",
         "model": "gpt-5.6-terra-900k",
         "reasoning_effort": "high",
         "toolsets": ["file"],
     }
     verifier = {
         "label": "기술검수",
-        "phase": "verifier",
-        "model": "gpt-5.6-sol-900k",
+        "phase": "verifier", "work_type": "verification",
+        "model": "gpt-6.1-sol",
         "reasoning_effort": "high",
         "toolsets": ["file"],
     }
@@ -596,15 +608,15 @@ def test_worker_verifier_is_forced_only_at_the_high_risk_boundary():
 
     worker = {
         "label": "작업",
-        "phase": "worker",
+        "phase": "worker", "work_type": "mechanical",
         "model": "gpt-5.6-terra-900k",
         "reasoning_effort": "high",
         "toolsets": ["file"],
     }
     verifier = {
         "label": "검수",
-        "phase": "verifier",
-        "model": "gpt-5.6-sol-900k",
+        "phase": "verifier", "work_type": "verification",
+        "model": "gpt-6.1-sol",
         "reasoning_effort": "high",
         "toolsets": ["file"],
     }
@@ -721,7 +733,7 @@ def test_non_parent_scopes_are_not_gated_or_headered():
 def test_duplicate_lane_labels_fail_closed():
     lane = {
         "label": "검수",
-        "phase": "worker",
+        "phase": "worker", "work_type": "mechanical",
         "model": "gpt-5.6-luna-900k",
         "reasoning_effort": "low",
         "toolsets": ["file"],
@@ -746,7 +758,7 @@ def test_declared_plan_must_match_delegate_tasks():
     key = plugin._turn_key(p.session_id, p._current_turn_id)
     lane = {
         "label": "자료수집",
-        "phase": "worker",
+        "phase": "worker", "work_type": "mechanical",
         "model": "gpt-5.6-luna-900k",
         "reasoning_effort": "low",
         "toolsets": ["web"],
@@ -809,15 +821,15 @@ def test_worker_verifier_is_sequenced_across_async_completions(monkeypatch):
     plugin._PLUGIN_STATE = FakeState()
     worker = {
         "label": "구현",
-        "phase": "worker",
-        "model": "gpt-5.6-terra-900k",
+        "phase": "worker", "work_type": "implementation",
+        "model": "claude-opus-5",
         "reasoning_effort": "high",
         "toolsets": ["file"],
     }
     verifier = {
         "label": "기술검수",
-        "phase": "verifier",
-        "model": "gpt-5.6-sol-900k",
+        "phase": "verifier", "work_type": "verification",
+        "model": "gpt-6.1-sol",
         "reasoning_effort": "high",
         "toolsets": ["file"],
     }
@@ -840,9 +852,9 @@ def test_worker_verifier_is_sequenced_across_async_completions(monkeypatch):
             return [
                 {
                     "label": "구현",
-                    "requested_model": "gpt-5.6-terra-900k",
+                    "requested_model": "claude-opus-5",
                     "requested_reasoning_effort": "high",
-                    "actual_model": "gpt-5.6-terra-900k",
+                    "actual_model": "claude-opus-5",
                     "actual_reasoning_effort": "high",
                     "status": "completed",
                     "completed": True,
@@ -851,9 +863,9 @@ def test_worker_verifier_is_sequenced_across_async_completions(monkeypatch):
         return [
             {
                 "label": "기술검수",
-                "requested_model": "gpt-5.6-sol-900k",
+                "requested_model": "gpt-6.1-sol",
                 "requested_reasoning_effort": "high",
-                "actual_model": "gpt-5.6-sol-900k",
+                "actual_model": "gpt-6.1-sol",
                 "actual_reasoning_effort": "high",
                 "status": "completed",
                 "completed": True,
@@ -1401,7 +1413,7 @@ def test_delegated_acceptance_carries_interim_status_note(registered_plugin):
                 "lanes": [
                     {
                         "label": "자료수집",
-                        "phase": "worker",
+                        "phase": "worker", "work_type": "mechanical",
                         "model": "gpt-5.6-luna-900k",
                         "reasoning_effort": "low",
                         "toolsets": ["web"],
@@ -1432,17 +1444,17 @@ def test_schema_prefers_direct_over_trivial_delegation_and_limits_astra():
     desc = plugin.ROUTE_TURN_SCHEMA["description"]
     assert "never delegate a question you can answer immediately" in desc
     assert "uncertain about RISK" in desc
-    assert "Astra) at xhigh/max is reserved for exceptional architecture" in desc
-    assert "extreme long-context integration, not routine work" in desc
-    assert "Do not assign Astra when a lower model can safely complete the work" in desc
-    assert "Astra does not replace Opus's independent critical verification" in desc
+    assert "exceptional architecture" in desc
+    assert "mechanical delegated work" not in desc or "work_type" in desc
+    assert "Verification MUST use gpt-6.1-sol" in desc
+    assert "any allowlisted model" in desc
 
 
 def test_delegation_phase_contract_exposes_only_verifier_state():
     worker_key = plugin._turn_key("session", "worker-turn")
     verifier_key = plugin._turn_key("session", "verifier-turn")
     with plugin._POLICY_LOCK:
-        plugin._TURN_PLANS[worker_key] = {"mode": "worker_verifier", "lanes": [{"phase": "worker"}]}
+        plugin._TURN_PLANS[worker_key] = {"mode": "worker_verifier", "lanes": [{"phase": "worker", "work_type": "mechanical"}]}
         plugin._TURN_PLANS[verifier_key] = {"mode": "verification", "lanes": [{"phase": "verifier"}]}
     try:
         assert plugin.delegation_phase_for_turn("session", "worker-turn") == "worker"

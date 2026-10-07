@@ -1,6 +1,6 @@
 # delegate-task-routing
 
-Current release: `v0.3.3` (local working version, unpublished; gateway activation pending). See [COMPATIBILITY.md](COMPATIBILITY.md) before changing the Hermes version and [CHANGELOG.md](CHANGELOG.md) for release history.
+Current release: `v0.4.0` (local working version, unpublished; gateway activation pending). See [COMPATIBILITY.md](COMPATIBILITY.md) before changing the Hermes version and [CHANGELOG.md](CHANGELOG.md) for release history.
 
 Persistent, in-process orchestration policy for Hermes. It forces a per-turn execution decision on Slack parent sessions, applies exact-allowlisted per-task routing, records requested versus actual child execution, and deterministically prepends the `_Alex: ..._` execution header.
 
@@ -21,13 +21,13 @@ Every normal Slack parent turn must call `route_turn` first. LLM request middlew
 - `parallel`: at least two genuinely independent outcomes. Implementation and its dependent tests are not separate parallel outcomes.
 - `worker_verifier`: separate execution/review for external sends/posts/publishing/submission, production changes/deployments, money/accounting, legal/security/access work, irreversible effects or genuinely high-error-cost output. Changes to routing/verification policy itself belong here, even in a local file.
 
-### Task-level development review (v0.3.3)
+### Task-level development review (v0.4.0)
 
 For recognized reversible local code-development requests, `pre_llm_call` creates a profile-scoped task ID. This **does not** change the per-turn route: direct/single/parallel remain available for ordinary work; high-risk `worker_verifier` always takes precedence (including authentication/permissions, payments/refunds, routing policy, production DB, deployment and external writes). Register a git repository root with `development_review(action=begin, root=<absolute git top-level>)` after `route_turn`. A task retains `task_id`, phase, checkpoint fingerprint, reviewed fingerprint and trigger (`milestone` or `completion`) in profile-scoped plugin state. Work may continue with normal tools and focused tests. Responses, including `development_review(action=progress)` turns, retain their original body; a short Korean status line discloses pending or failed review without suppressing the conversation.
 
 At a meaningful milestone or before final readiness, call `development_review(action=checkpoint, task_id=..., trigger=milestone|completion)`. If the current revision is already reviewed, `ready` remains true without a repeat review. Otherwise call `route_turn(mode=single, review_task_id=..., lanes=[one reviewer])`, then `delegate_task` using that accepted lane contract. The patched native entrypoint supplies the read-only independent review goal and JSON output schema after the core dispatcher strips hidden fields, rechecking the artifact before launch. The parent may send an interim progress message while the child runs. The authenticated core async event must have `state=completed`, the same parent (or verified compression tip), one independent child, completed exit, a valid JSON object containing exactly `verdict`, `revision`, and string `findings`, `verdict=pass`, the frozen fingerprint, and an unchanged repository snapshot. `schema_valid=true` is expected; older results with `schema_valid=null` are accepted only if they satisfy the same exact JSON contract. Only then does `development_review(action=ready)` return ready for the exact artifact. A later edit or commit invalidates it; checkpoint again. Terminal malformed output or a failed verdict is recorded as `review_failed` with a reason, findings and a summary excerpt capped at 500 characters, not silently retried. Checkpoint explicitly for a new review. Failed or pending reviews cannot authorize completion. After reporting a reviewed task, `development_review(action=close)` ends its active lifecycle; this only succeeds for the reviewed revision. Closed tasks may still disclose later artifact changes.
 
-For this single checkpoint review, the lane's `phase` may be `worker` or `verifier`; `verifier` is normalized to `worker` for dispatch. Without `review_task_id`, single mode still accepts worker lanes only, and checkpoint review never bypasses mandatory high-risk `worker_verifier`. Reviewer JSON may be markdown-fenced or surrounded by prose: extraction uses the same helper as the core output validator (with an equivalent local import fallback), then the extracted object must satisfy the exact review contract and both revision checks. Prose alone or schema-invalid objects do not grant readiness.
+For this single checkpoint review, the lane's `phase` may be `worker` or `verifier`, but `work_type` must be `verification` and the model must be `gpt-6.1-sol` (or the configured fixed verification model); `verifier` is normalized to `worker` for dispatch. Without `review_task_id`, single mode still accepts worker lanes only, and checkpoint review never bypasses mandatory high-risk `worker_verifier`. Reviewer JSON may be markdown-fenced or surrounded by prose: extraction uses the same helper as the core output validator (with an equivalent local import fallback), then the extracted object must satisfy the exact review contract and both revision checks. Prose alone or schema-invalid objects do not grant readiness.
 
 Fingerprint scope is repository `HEAD` and all non-ignored tracked/untracked file contents, names, deletions and symlink targets. Ignored/generated files and external services are outside this gate. The development-intent classifier is a deterministic backstop, not semantic proof that every coding paraphrase was detected: explicitly call `begin` for a missed task. The final-output transform is **status presentation**, not a general re-entry or prose-suppression hook: core `agent/turn_finalizer.py` runs the first nonempty `transform_llm_output` on truthy, uninterrupted responses only, and another earlier transform or streaming preview may bypass this transform. Registration, review dispatch, exact-artifact readiness and core-ledger authentication are enforced at plugin tool/async boundaries. Do not represent the local tests as unconditional pre-delivery enforcement across all delivery paths.
 
@@ -47,7 +47,7 @@ After a delegated decision, the next model call is forced to `delegate_task`. A 
 {
   "goal": "Analyze the operational risk",
   "label": "위험분석",
-  "model": "gpt-6.1-sol",
+  "model": "claude-opus-5",
   "reasoning_effort": "high",
   "toolsets": ["file", "code_execution"]
 }
@@ -94,7 +94,7 @@ plugins:
     delegate-task-routing:
       settings:
         allowed_models:
-          - claude-opus-4-8
+          - claude-opus-5
           - claude-fable-5.1
           - gpt-6-astra
           - gpt-6.1-sol
@@ -111,40 +111,74 @@ separate gateway process per policy: this plugin patches process-global private
 Python functions and has not been validated with different profile allowlists
 in one process.
 
-### Six-model selection and recovery
+### Fixed work-type models and recovery
 
-| Model | Intended lane |
+Every `route_turn` lane requires `work_type` with an exact enum value:
+
+| Work type | Required primary model | Scope |
+| --- | --- | --- |
+| `implementation` | `claude-opus-5` | Code changes, file/sheet/doc writing, Figma edits, deploy preparation, any local/external write |
+| `research` | `claude-opus-5` | Web research, DB query analysis, root-cause diagnosis, comparison/recommendation |
+| `verification` | `gpt-6.1-sol` | Independent checks; every verifier phase and checkpoint reviewer |
+| `mechanical` | Any allowlisted model | Extraction, reformatting, deterministic checks, simple visual QA |
+| `architecture` | Any allowlisted model | Exceptional architecture/design |
+
+Both a `phase=verifier` lane and a `review_task_id` lane require
+`work_type=verification`, including a checkpoint reviewer labeled `worker`.
+Checks run **before** normalizing a single checkpoint verifier to worker dispatch.
+A rejected route tells the model the required work type/model. The declared work
+type is a semantic contract, not automatic classification of arbitrary goals.
+Tasks need not carry `work_type`: matching remains label/model/effort/toolsets.
+
+Partial `settings.fixed_models` overrides merge with the defaults below. Values
+must be exact IDs present in `allowed_models`; unknown keys/invalid values fail
+closed. Registered schema/guidance reflects the effective mapping at load time:
+
+```yaml
+fixed_models:
+  implementation: claude-opus-5
+  research: claude-opus-5
+  verification: gpt-6.1-sol
+```
+
+This changes delegated lane models, not the parent model or risk policy. Trivial
+safe work stays direct; bounded work uses single; independent outcomes use parallel;
+consequential work retains worker_verifier with separate phases.
+
+Recovery is one ordered chain. Each primary receives only the models **after** it:
+
+| Primary | Ordered fallback models |
 | --- | --- |
-| `gpt-6-luna` | Simple extraction, formatting, mechanical checks; low/medium effort |
-| `gpt-6.1-sol` | General analysis, research, implementation; medium/high; delegation default |
-| `claude-sonnet-5` | General/medium Claude alternative to Sol; cost-appropriate Luna outage recovery |
-| `claude-opus-4-8` | Critical independent verification and Codex recovery |
-| `gpt-6-astra` | Exceptional architecture and unusually difficult synthesis |
-| `claude-fable-5.1` | Extreme long-context integration; Astra recovery |
+| `gpt-6.1-sol` | `gpt-6-sol`, `gpt-5.6-sol`, `gpt-6-luna`, `claude-opus-5`, `claude-sonnet-5` |
+| `gpt-6-sol` | `gpt-5.6-sol`, `gpt-6-luna`, `claude-opus-5`, `claude-sonnet-5` |
+| `gpt-5.6-sol` | `gpt-6-luna`, `claude-opus-5`, `claude-sonnet-5` |
+| `gpt-6-luna` | `claude-opus-5`, `claude-sonnet-5` |
+| `claude-opus-5` | `claude-sonnet-5` |
+| `claude-sonnet-5` | None |
 
-This changes model choice, not risk policy: trivial safe work stays direct;
-bounded work uses single; independent outcomes use parallel; consequential
-external writes, production, money, legal, security and ambiguous high-risk work
-retain worker_verifier with separate execution and verification phases.
+Astra, Fable and all other models outside this chain have **no automatic fallback**.
+`gpt-6-sol` and `gpt-5.6-sol` are fallback-authorized without being selectable
+primary lanes. Recovery authorization is the union of the separate chain-derived
+fallback allowlist and `allowed_models`; narrowing primary choices does not remove
+chain models from recovery. Explicit `fallback_providers: []` disables recovery.
 
-Automatic peers are exact IDs: Luna→Sonnet, Sol→Opus, Astra→Fable. Sonnet is
-explicitly authorized as the sixth model and avoids escalating simple Luna work
-to Opus or Fable on outage. Sol remains the delegation default.
-Unknown/retired IDs have no automatic peer. Peers omitted from `allowed_models`
-are not used. The primary runs first; the native runtime decides whether a failure
-qualifies for fallback, and actual-route metadata exposes any model change.
+Each entry declares `openai-codex` for `gpt-*` or `anthropic` for `claude-*`.
+The core resolves credentials lazily through its shared provider runtime at
+activation, derives the correct API mode, and walks onward on resolution/eligible
+provider failures; the plugin does not copy credentials from the current lane.
+Automatic suffixes cover either parent provider and include Anthropic primaries.
+Operator-pinned provider, endpoint, key, API mode or ACP transport gets no implicit
+recovery; explicit operator chains remain supported. Explicit chains are copied
+without mutation and must use recovery-authorized IDs and matching providers;
+malformed/unauthorized chains fail closed before construction. The primary runs
+first and the native runtime decides which failures qualify for failover. There
+is no verifier/implementer-model special case on fallback; actual-route metadata
+discloses requested versus actual model/provider.
 
-Previously automatic recovery was nested inside cross-provider credential
-resolution and did not cover a Codex parent with a Codex child. Recovery now
-covers both parent-provider cases. Credential resolution itself still only runs
-when crossing providers without a trusted override. Operator-pinned provider,
-endpoint, credential, API mode or ACP transport gets no implicit recovery route;
-an explicit `fallback_providers` chain remains possible. Explicit `[]` disables
-fallback. Explicit chains are preserved without shared mutation but must have
-allowlisted models and their matching native providers; malformed or unauthorized
-entries fail closed before construction. Credential-resolution failures also fail
-closed (they are not automatic provider retries). No Anthropic→Codex or unknown
-model fallback is invented.
+Availability checked before this update: both fallback-only Codex IDs appeared in
+the authenticated catalog and tiny calls completed HTTP 200. `claude-opus-5`
+appeared in the native OAuth catalog, but the tiny inference call returned HTTP
+429; successful Opus inference remains unverified. No IDs were substituted.
 
 The startup-captured schema, validator and imported plugin are **not hot-reloaded**.
 Changing `delegation.model` may affect newly constructed children because the core

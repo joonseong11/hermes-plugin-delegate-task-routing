@@ -51,19 +51,31 @@ except ImportError:
                 return raw[start : end + 1]
         return raw
 
-PLUGIN_VERSION = "0.3.3"
+PLUGIN_VERSION = "0.4.0"
 PLUGIN_ID = "delegate-task-routing"
 _PATCH_MARKER = "_delegate_task_routing_plugin_v1"
 _ROUTE_FIELDS = ("label", "model", "reasoning_effort", "toolsets")
 _LOG = logging.getLogger(__name__)
 DEFAULT_ALLOWED_MODELS = (
-    "claude-opus-4-8",
+    "claude-opus-5",
     "claude-fable-5.1",
     "gpt-6-astra",
     "gpt-6.1-sol",
     "gpt-6-luna",
     "claude-sonnet-5",
 )
+DEFAULT_FIXED_MODELS = {
+    "implementation": "claude-opus-5",
+    "research": "claude-opus-5",
+    "verification": "gpt-6.1-sol",
+}
+WORK_TYPES = ("implementation", "research", "verification", "mechanical", "architecture")
+# Recovery authorization is independent of primary lane selection.
+DEFAULT_RECOVERY_CHAIN = (
+    "gpt-6.1-sol", "gpt-6-sol", "gpt-5.6-sol", "gpt-6-luna",
+    "claude-opus-5", "claude-sonnet-5",
+)
+DEFAULT_FALLBACK_MODELS = frozenset(DEFAULT_RECOVERY_CHAIN)
 DEFAULT_ALLOWED_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 DEFAULT_ALLOWED_TOOLSETS = (
     "browser",
@@ -320,9 +332,8 @@ def _review_action(args: dict[str, Any], **kw: Any) -> str:
 # override_provider is passed, so a gpt-* model gets sent to api.anthropic.com
 # and 404s ("model: gpt-5-6-terra-900k"). We classify the model family, pin the
 # matching provider via override_provider (letting the runtime re-derive
-# base_url/api_mode/credentials), and attach an Anthropic-peer fallback chain so
-# a real codex outage degrades to a working model with a visible requested→actual
-# note instead of a silent failed child.
+# base_url/api_mode/credentials), and attach an ordered recovery chain so
+# eligible provider failures degrade with a visible requested→actual note.
 _ANTHROPIC_PROVIDER = "anthropic"
 _CODEX_PROVIDER = "openai-codex"
 
@@ -342,19 +353,11 @@ def _model_provider_family(model: str) -> str | None:
     return None
 
 
-def _anthropic_peer_for(model: str) -> str | None:
-    """Explicit recovery peers, never a guessed generation-wide fallback.
-
-    Luna uses the cost-appropriate Sonnet peer; Sol uses Opus; Astra uses Fable.
-    Sonnet is also the general/medium Claude alternative to the Sol default.
-    Recovery does not change routine model selection. Unknown IDs
-    have no automatic peer. The caller must also check the current allowlist.
-    """
-    return {
-        "gpt-6-luna": "claude-sonnet-5",
-        "gpt-6.1-sol": "claude-opus-4-8",
-        "gpt-6-astra": "claude-fable-5.1",
-    }.get(model)
+def _recovery_models_after(model: str) -> tuple[str, ...]:
+    """Exact ordered suffix; models outside the chain have no automatic recovery."""
+    if model not in DEFAULT_RECOVERY_CHAIN:
+        return ()
+    return DEFAULT_RECOVERY_CHAIN[DEFAULT_RECOVERY_CHAIN.index(model) + 1:]
 
 
 def _routed_fallback_config(
@@ -362,17 +365,19 @@ def _routed_fallback_config(
     allowed_models: Sequence[str],
     routing_cfg: Any,
     *,
-    automatic_peer: bool,
+    automatic_recovery: bool,
 ) -> dict[str, Any]:
-    """Keep fallback inside the route's allowlist and operator-owned config.
+    """Validate operator chains against primary + separately authorized recovery IDs.
 
     Explicit chains (including []) win. Reject malformed or unauthorized routes
     before construction rather than letting the native normalizer silently drop
-    them. Copy the config so simultaneous lanes never mutate shared defaults.
+    them. Provider-only entries let core resolve fresh credentials through the
+    shared provider runtime at activation, never copying the parent's key.
     """
     if routing_cfg is not None and not isinstance(routing_cfg, Mapping):
         raise ValueError("Routed fallback config must be an object")
     cfg = copy.deepcopy(dict(routing_cfg or {}))
+    fallback_allow = set(allowed_models) | DEFAULT_FALLBACK_MODELS
     declared = cfg.get("fallback_providers")
     if declared is not None:
         if not isinstance(declared, list):
@@ -382,16 +387,15 @@ def _routed_fallback_config(
                 raise ValueError("Routed fallback entries must be objects")
             peer = entry.get("model")
             provider = entry.get("provider")
-            if not isinstance(peer, str) or peer not in allowed_models:
-                raise ValueError("Routed fallback model is not in allowed_models")
+            if not isinstance(peer, str) or peer not in fallback_allow:
+                raise ValueError("Routed fallback model is not in the fallback allowlist")
             if not provider or provider != _model_provider_family(peer):
                 raise ValueError("Routed fallback provider does not match the approved model")
     else:
-        peer = _anthropic_peer_for(model) if automatic_peer else None
-        cfg["fallback_providers"] = (
-            [{"provider": _ANTHROPIC_PROVIDER, "model": peer}]
-            if peer and peer in allowed_models else []
-        )
+        cfg["fallback_providers"] = [
+            {"provider": _model_provider_family(peer), "model": peer}
+            for peer in (_recovery_models_after(model) if automatic_recovery else ())
+        ]
     return cfg
 
 ROUTE_TURN_SCHEMA = {
@@ -435,24 +439,19 @@ ROUTE_TURN_SCHEMA = {
         "choose the higher mode; when merely uncertain whether delegation is "
         "worth it, choose direct. With mode=direct, lanes MUST be the empty "
         "array []. "
-        "Per-lane model assignment — pick the cheapest model that is safe: "
-        "gpt-6-luna (Luna) at low/medium for simple or mechanical delegated work "
-        "(extraction, reformatting, deterministic checks, simple visual QA); "
-        "gpt-6.1-sol (Sol) at medium/high is the general default for analysis, "
-        "research, implementation, and code work. claude-sonnet-5 (Sonnet) at medium "
-        "is the general/medium Claude alternative to Sol for those tasks; "
-        "Sol remains the delegation default. claude-opus-4-8 (Opus) at high/max "
-        "is for critical independent verification (legal/financial correctness, "
-        "production safety, security, adversarial review) and Codex fallback. "
-        "gpt-6-astra (Astra) at xhigh/max is reserved for exceptional architecture "
-        "and unusually difficult multi-domain synthesis. Do not assign Astra when "
-        "a lower model can safely complete the work; Astra does not replace Opus's "
-        "independent critical verification. claude-fable-5.1 (Fable) is reserved "
-        "for extreme long-context integration, not routine work. Codex recovery "
-        "peers are Luna→Sonnet, Sol→Opus, Astra→Fable, only if the peer is allowlisted. "
-        "Luna→Sonnet is the cost-appropriate outage recovery; do not escalate "
-        "simple Luna work to Opus or Fable automatically. Unknown models "
-        "have no automatic fallback. Give identical tasks identical models. "
+        "Per-lane work_type is required: implementation (code changes, file/sheet/doc "
+        "writing, Figma edits, deploy preparation, any local/external write) and "
+        "research (web research, DB query analysis, root-cause diagnosis, comparison "
+        "or recommendation) MUST use claude-opus-5. Verification MUST use "
+        "gpt-6.1-sol with work_type=verification, including every phase=verifier "
+        "and every review_task_id checkpoint reviewer. Mechanical work (extraction, "
+        "reformatting, deterministic checks, simple visual QA) and exceptional "
+        "architecture may choose any allowlisted model, e.g. gpt-6-luna, gpt-6-astra, "
+        "claude-sonnet-5 or claude-fable-5.1. These fixed models are operator-"
+        "configurable; follow the registered work_type guidance and validation errors. "
+        "Recovery follows the ordered suffix of gpt-6.1-sol → gpt-6-sol → "
+        "gpt-5.6-sol → gpt-6-luna → claude-opus-5 → claude-sonnet-5; models outside "
+        "this chain have no automatic fallback. Give identical tasks identical models. "
         "Declare the exact model, effort, and "
         "least-privilege toolsets for every lane. Normally call route_turn once per "
         "turn. Only a direct skill-refresh preflight may reroute before any write "
@@ -480,6 +479,10 @@ ROUTE_TURN_SCHEMA = {
                             "type": "string",
                             "enum": ["worker", "verifier"],
                         },
+                        "work_type": {
+                            "type": "string", "enum": list(WORK_TYPES),
+                            "description": "Required semantic work category. implementation/research: claude-opus-5; verification (also phase=verifier or checkpoint reviewer): gpt-6.1-sol; mechanical/architecture: any allowlisted model.",
+                        },
                         "model": {"type": "string"},
                         "reasoning_effort": {"type": "string"},
                         "toolsets": {
@@ -492,6 +495,7 @@ ROUTE_TURN_SCHEMA = {
                     "required": [
                         "label",
                         "phase",
+                        "work_type",
                         "model",
                         "reasoning_effort",
                         "toolsets",
@@ -612,8 +616,8 @@ def _make_schema(
         "type": "string",
         "enum": list(allowed_models),
         "description": (
-            "Required exact model id for this child. Choose it from the operator-"
-            "approved list according to task difficulty."
+            "Required exact model id for this child. Match the accepted route_turn "
+            "lane and its operator-configured work_type model policy."
         ),
     }
     properties["reasoning_effort"] = {
@@ -829,13 +833,13 @@ def _install_patches(
                         f"'{target_provider}': {exc}"
                     ) from exc
             # The route pins the child model, so the native runtime does not
-            # inherit parent fallback. Attach an approved peer independently of
+            # inherit parent fallback. Attach the approved recovery suffix independently of
             # cross-provider credential resolution, but never invent recovery
             # for operator-pinned credentials/transports. Explicit chains still
             # work there after validation. [] always disables fallback.
             kwargs["routing_cfg"] = _routed_fallback_config(
                 route["model"], allowed_models, kwargs.get("routing_cfg"),
-                automatic_peer=(target_provider == _CODEX_PROVIDER and not already_pinned),
+                automatic_recovery=not already_pinned,
             )
         if "toolsets" in route:
             kwargs["toolsets"] = list(route["toolsets"])
@@ -1128,6 +1132,20 @@ def _requires_worker_verifier(user_message: Any) -> bool:
     return _worker_verifier_requirement(user_message) is True
 
 
+def _fixed_model_policy(value: Any = None) -> dict[str, str]:
+    """Merge partial operator overrides without accepting typos or empty models."""
+    if value is None:
+        return dict(DEFAULT_FIXED_MODELS)
+    if not isinstance(value, Mapping):
+        raise ValueError("fixed_models must be an object")
+    if set(value) - set(DEFAULT_FIXED_MODELS):
+        raise ValueError("fixed_models accepts only implementation, research, verification")
+    for work_type, model in value.items():
+        if not isinstance(model, str) or not model or model != model.strip():
+            raise ValueError(f"fixed_models.{work_type} must be an exact non-empty model ID")
+    return {**DEFAULT_FIXED_MODELS, **value}
+
+
 def _validate_plan(
     payload: Mapping[str, Any],
     *,
@@ -1135,7 +1153,9 @@ def _validate_plan(
     allowed_efforts: Sequence[str],
     allowed_toolsets: Sequence[str],
     require_worker_verifier: bool | None = None,
+    fixed_models: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
+    fixed = _fixed_model_policy(fixed_models)
     mode = str(payload.get("mode") or "").strip().lower()
     reason = str(payload.get("reason") or "").strip()
     lanes = payload.get("lanes")
@@ -1164,7 +1184,7 @@ def _validate_plan(
             raise ValueError(f"lane {index} must be an object")
         missing = [
             field
-            for field in ("label", "phase", "model", "reasoning_effort", "toolsets")
+            for field in ("label", "phase", "work_type", "model", "reasoning_effort", "toolsets")
             if lane.get(field) is None
             or (isinstance(lane.get(field), str) and not str(lane.get(field)).strip())
         ]
@@ -1177,6 +1197,23 @@ def _validate_plan(
         toolsets = _as_string_list(lane["toolsets"], setting=f"lanes[{index}].toolsets")
         if phase not in {"worker", "verifier"}:
             raise ValueError(f"lane {index} phase must be worker or verifier")
+        work_type = lane["work_type"]
+        if not isinstance(work_type, str) or work_type not in WORK_TYPES:
+            raise ValueError(f"lane {index} work_type must be one of {', '.join(WORK_TYPES)}")
+        # Check the original phase BEFORE checkpoint normalization, including
+        # reviewers declared as workers. Relabeling cannot bypass verification.
+        is_verifier = phase == "verifier" or bool(payload.get("review_task_id"))
+        if is_verifier and work_type != "verification":
+            raise ValueError(
+                f"lane {index} verifier/review lane requires work_type=verification "
+                f"and model={fixed['verification']}; use {fixed['verification']}"
+            )
+        required_model = fixed.get(work_type)
+        if required_model and model != required_model:
+            raise ValueError(
+                f"lane {index} work_type={work_type} requires model={required_model}; "
+                f"use {required_model} instead of {model}"
+            )
         # A checkpoint reviewer is a single dispatch lane, not the second stage
         # of high-risk worker_verifier. Preserve downstream worker semantics.
         if mode == "single" and payload.get("review_task_id") and phase == "verifier":
@@ -1192,6 +1229,7 @@ def _validate_plan(
             {
                 "label": label,
                 "phase": phase,
+                "work_type": work_type,
                 "model": model,
                 "reasoning_effort": effort,
                 "toolsets": toolsets,
@@ -2214,6 +2252,33 @@ def register(ctx) -> None:
             allowed_toolsets=allowed_toolsets,
         )
         _DELEGATE_TASK_REQUEST_SCHEMA = copy.deepcopy(schema)
+        fixed_models = _fixed_model_policy(ctx.get_config("fixed_models", None))
+        for work_type, model in fixed_models.items():
+            if model not in allowed_models:
+                raise ValueError(f"fixed_models.{work_type}={model} must be in allowed_models")
+        route_schema = copy.deepcopy(ROUTE_TURN_SCHEMA)
+        lane_schema = route_schema["parameters"]["properties"]["lanes"]["items"]
+        lane_schema["properties"]["model"]["enum"] = list(allowed_models)
+        lane_schema["properties"]["work_type"]["description"] = (
+            f"implementation: {fixed_models['implementation']}; "
+            f"research: {fixed_models['research']}; "
+            f"verification (including phase=verifier/checkpoint): {fixed_models['verification']}; "
+            "mechanical/architecture: any allowlisted model."
+        )
+        # Replace only policy IDs, not recovery-chain IDs, in the selection text.
+        start = route_schema["description"].index("Per-lane work_type")
+        end = route_schema["description"].index("Recovery follows", start)
+        route_schema["description"] = (
+            route_schema["description"][:start]
+            + "Per-lane work_type is required. "
+            + lane_schema["properties"]["work_type"]["description"]
+            + " Every verifier or review_task_id lane requires work_type=verification. "
+            + "implementation includes code/file/sheet/doc/Figma edits, deploy preparation "
+            "and any local/external write; research includes web/DB analysis, diagnosis "
+            "and comparison/recommendation; mechanical includes extraction, reformatting, "
+            "deterministic checks and simple visual QA; architecture is exceptional design. "
+            + route_schema["description"][end:]
+        )
 
         def route_handler(args: dict[str, Any], **kw: Any):
             parent_agent = kw.get("parent_agent")
@@ -2255,6 +2320,7 @@ def register(ctx) -> None:
                     allowed_efforts=allowed_efforts,
                     allowed_toolsets=allowed_toolsets,
                     require_worker_verifier=_TURN_RISK_REQUIREMENTS.get(guard_key),
+                    fixed_models=fixed_models,
                 )
                 review_id = str(args.get("review_task_id") or "")
                 if review_id:
@@ -2362,9 +2428,9 @@ def register(ctx) -> None:
         route_registration = ctx.register_tool(
             name="route_turn",
             toolset="delegation",
-            schema=ROUTE_TURN_SCHEMA,
+            schema=route_schema,
             handler=route_handler,
-            description=ROUTE_TURN_SCHEMA["description"],
+            description=route_schema["description"],
             emoji="🧭",
         )
         if route_registration is None:

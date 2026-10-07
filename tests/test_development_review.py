@@ -251,7 +251,7 @@ def test_route_dispatch_and_async_completion_contract(captured_core_entrypoint, 
     rev = invoke(ctx, "owner", "turn-1", "checkpoint", task_id=task_id)["revision"]
     p = parent()
     p.session_id, p._current_turn_id, p.platform, p._delegate_depth = "owner", "turn-1", "slack", 0
-    lane = {"label": "independent", "phase": "worker", "model": "gpt-6.1-sol",
+    lane = {"label": "independent", "phase": "worker", "work_type": "verification", "model": "gpt-6.1-sol",
             "reasoning_effort": "high", "toolsets": ["file"]}
     route = json.loads(ctx.tools["route_turn"]({"mode": "single", "reason": "review checkpoint",
                                                "review_task_id": task_id, "lanes": [lane]}, parent_agent=p))
@@ -409,7 +409,7 @@ def test_core_review_rechecks_revision_before_launch(captured_core_entrypoint, t
     invoke(ctx, "owner", "turn-1", "checkpoint", task_id=task_id)
     p = parent()
     p.session_id, p._current_turn_id, p.platform, p._delegate_depth = "owner", "turn-1", "slack", 0
-    lane = {"label": "independent", "phase": "worker", "model": "gpt-6.1-sol",
+    lane = {"label": "independent", "phase": "worker", "work_type": "verification", "model": "gpt-6.1-sol",
             "reasoning_effort": "high", "toolsets": ["file"]}
     route = json.loads(ctx.tools["route_turn"]({"mode": "single", "reason": "review checkpoint",
                                                "review_task_id": task_id, "lanes": [lane]}, parent_agent=p))
@@ -471,7 +471,7 @@ def test_live_slack_fenced_summary_shape_is_reviewed(registered_plugin, tmp_path
     plugin._save_review(task)
     event = reviewer_event(revision)
     result = event["results"][0]
-    result["routing"]["actual_model"] = "claude-opus-4-8"
+    result["routing"]["actual_model"] = "claude-opus-5"
     result["summary"] = f'```json\n{{"verdict": "pass", "revision": "{revision}", "findings": "none"}}\n```'
     assert validate_output(result["summary"], plugin._REVIEW_SCHEMA) == (True, [])
     ledger(tmp_path, did, event, owner=sid)
@@ -516,7 +516,7 @@ def test_single_checkpoint_verifier_is_normalized_and_dispatched(captured_core_e
     invoke(ctx, "owner", "turn-1", "checkpoint", task_id=task_id)
     p = parent()
     p.session_id, p._current_turn_id, p.platform, p._delegate_depth = "owner", "turn-1", "slack", 0
-    lane = {"label": "independent", "phase": "verifier", "model": "claude-opus-4-8",
+    lane = {"label": "independent", "phase": "verifier", "work_type": "verification", "model": "gpt-6.1-sol",
             "reasoning_effort": "high", "toolsets": ["file"]}
     payload = {"mode": "single", "reason": "review checkpoint", "review_task_id": task_id, "lanes": [lane]}
     route = json.loads(ctx.tools["route_turn"](payload, parent_agent=p))
@@ -550,7 +550,7 @@ def test_checkpoint_verifier_exception_does_not_relax_other_guards(registered_pl
     key = plugin._turn_key("owner", "turn-1")
     monkeypatch.setitem(plugin._TURN_RISK_REQUIREMENTS, key, kind == "high_risk")
     before = copy.deepcopy(plugin._TURN_PLANS[key])
-    lane = {"label": "reviewer", "phase": "verifier", "model": "claude-opus-4-8",
+    lane = {"label": "reviewer", "phase": "verifier", "work_type": "verification", "model": "gpt-6.1-sol",
             "reasoning_effort": "high", "toolsets": ["file"]}
     payload = {"mode": "single", "reason": "review checkpoint", "review_task_id": task_id, "lanes": [lane]}
     if kind == "no_review_id":

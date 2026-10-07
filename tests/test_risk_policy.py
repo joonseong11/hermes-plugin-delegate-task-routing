@@ -67,9 +67,10 @@ HIGH_RISK = [
 
 
 def plan(mode):
-    worker = {"label": "work", "phase": "worker", "model": "gpt-6.1-sol",
+    worker = {"label": "work", "phase": "worker", "work_type": "implementation", "model": "claude-opus-5",
               "reasoning_effort": "high", "toolsets": ["file"]}
-    verifier = {**worker, "label": "review", "phase": "verifier"}
+    verifier = {**worker, "label": "review", "phase": "verifier",
+                "work_type": "verification", "model": "gpt-6.1-sol"}
     lanes = {"direct": [], "single": [worker],
              "parallel": [worker, {**worker, "label": "independent"}],
              "worker_verifier": [worker, verifier]}[mode]
