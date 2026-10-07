@@ -2,6 +2,31 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.0] - 2026-10-07
+
+### Changed
+
+- Replace the previous Opus roster ID with `claude-opus-5`. Require per-lane `work_type`: implementation/research use Opus 5; verification uses `gpt-6.1-sol`; mechanical/architecture remain free among allowlisted models. Enforce verification on the original verifier phase and on every checkpoint review lane before normalizing dispatch. `settings.fixed_models` supports validated partial overrides, reflected in the registered schema and guidance. Task matching remains label/model/effort/toolsets; tasks need not carry `work_type`.
+- Replace single-peer recovery with each model's ordered suffix of `gpt-6.1-sol → gpt-6-sol → gpt-5.6-sol → gpt-6-luna → claude-opus-5 → claude-sonnet-5`. Astra, Fable and other models outside this chain have no automatic fallback. Separate recovery authorization accepts fallback-only Sol generations without authorizing them as primary lanes. Provider entries use `openai-codex`/`anthropic` and native lazy credential resolution; explicit chains still validate fail-closed, explicit `[]` disables recovery, and trusted transport/credential overrides gain no implicit recovery.
+
+### Verification
+
+- Added enforcement, configuration/schema override, task matching, every recovery position, same/cross-provider construction and installed-core normalization regressions; retained v0.3.x review-gate tests.
+- Live provider catalogs list `gpt-6-sol`, `gpt-5.6-sol` and `claude-opus-5`. Tiny Codex calls completed HTTP 200; Opus 5 native OAuth inference hit HTTP 429 (availability is catalog-confirmed, successful inference remains unverified). A raw API-key-style Anthropic probe returned HTTP 401 before switching to the actual native OAuth adapter.
+- Gateway restart and fresh Slack routing/actual-failover smoke tests remain operator-owned and pending. No Hermes core changes or PR.
+
+## [0.3.3] - 2026-10-07
+
+### Fixed
+
+- Parse reviewer summaries through Hermes' `extract_json_candidate`, with an identical local fallback when the helper cannot be imported. Markdown-fenced JSON and surrounding prose now follow the core output validator's extraction rules; exact verdict schema, independent child/extension authentication and both revision checks remain mandatory, including for schema-less results.
+- Accept a single checkpoint reviewer lane labeled `verifier` when `review_task_id` is supplied, normalizing it to `worker` for unchanged dispatch semantics. Ordinary single/parallel lane restrictions and mandatory high-risk worker/verifier routing remain unchanged. Updated `route_turn` guidance and schema description.
+
+### Tests
+
+- Added fenced pass/fail, revision mismatch, non-JSON prose, artifact mutation, authentication, live Slack summary-shape, fallback/core extraction parity and reviewer dispatch/guard regressions; expanded schema-less exact-contract checks to fenced/prose wrappers.
+- Gateway activation and a fresh live Slack smoke test remain pending; no Hermes core or live plugin-state changes.
+
 ## [0.3.2] - 2026-10-07
 
 ### Fixed
@@ -24,7 +49,7 @@ All notable changes to this project are documented here.
 
 ### Changed
 
-- Default model roster is exactly Opus 4.8, Fable 5.1, GPT-6 Astra, Sol, Luna and Sonnet 5. Guidance assigns Luna simple work, Sol general work (unchanged delegation default), Sonnet the general/medium Claude alternative, Opus critical independent verification/Codex recovery, Astra exceptional architecture, and Fable extreme long context. Existing direct/single/parallel/worker_verifier risk policy is unchanged.
+- Default model roster is exactly Opus 5, Fable 5.1, GPT-6 Astra, Sol, Luna and Sonnet 5. Guidance assigns Luna simple work, Sol general work (unchanged delegation default), Sonnet the general/medium Claude alternative, Opus critical independent verification/Codex recovery, Astra exceptional architecture, and Fable extreme long context. Existing direct/single/parallel/worker_verifier risk policy is unchanged.
 - Cross-provider routed lanes resolve the target provider's complete credential bundle instead of inheriting the wrong endpoint. Automatic recovery is now independent of that resolution and also covers same-provider Codex parent/child routes.
 - Exact recovery map: GPT-6 Luna→Sonnet, Sol→Opus, Astra→Fable. Sonnet is explicitly authorized as the sixth model and supplies cost-appropriate Luna outage recovery. Unknown IDs have no guessed peer; absent peers disable automatic fallback.
 - Explicit fallback chains must use allowlisted models and matching native providers. Malformed or unauthorized chains fail closed; explicit disable and trusted credential/transport overrides are respected without shared-config mutation.
@@ -41,7 +66,7 @@ All notable changes to this project are documented here.
 - An authenticated, non-sensitive `delegation_lifecycle_for_turn` observer contract.
 - Worker/verifier completion-chain ownership so presentation plugins finalize only the delegations owned by the authenticated completion turn.
 - Durable one-time completion claims reject replayed envelopes, and retention prunes only consumed terminal records so live mandatory-verification chains cannot disappear.
-- `route_turn` guidance now documents `claude-opus-4-8`, `claude-sonnet-5`, and `claude-fable-5.1` (anthropic) as selectable child lanes: sonnet-5 as a Terra-class general lane, opus-4-8 as a Sol-class high-quality/high-risk lane, and fable-5.1 (1M context) as an Astra-class very-large-context lane. Claude lanes are the preferred stable path when codex-family lanes are rate-limited (HTTP 429) or slow to first token. Operators must also list each model in the `allowed_models` setting for it to be selectable.
+- `route_turn` guidance now documents `claude-opus-5`, `claude-sonnet-5`, and `claude-fable-5.1` (anthropic) as selectable child lanes: sonnet-5 as a Terra-class general lane, opus-5 as a Sol-class high-quality/high-risk lane, and fable-5.1 (1M context) as an Astra-class very-large-context lane. Claude lanes are the preferred stable path when codex-family lanes are rate-limited (HTTP 429) or slow to first token. Operators must also list each model in the `allowed_models` setting for it to be selectable.
 
 ## [0.2.8] - 2026-09-09
 

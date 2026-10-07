@@ -251,7 +251,7 @@ def test_route_dispatch_and_async_completion_contract(captured_core_entrypoint, 
     rev = invoke(ctx, "owner", "turn-1", "checkpoint", task_id=task_id)["revision"]
     p = parent()
     p.session_id, p._current_turn_id, p.platform, p._delegate_depth = "owner", "turn-1", "slack", 0
-    lane = {"label": "independent", "phase": "worker", "model": "gpt-6.1-sol",
+    lane = {"label": "independent", "phase": "worker", "work_type": "verification", "model": "gpt-6.1-sol",
             "reasoning_effort": "high", "toolsets": ["file"]}
     route = json.loads(ctx.tools["route_turn"]({"mode": "single", "reason": "review checkpoint",
                                                "review_task_id": task_id, "lanes": [lane]}, parent_agent=p))
@@ -343,8 +343,9 @@ def test_review_failure_is_recorded_and_body_is_preserved(registered_plugin, tmp
     assert invoke(ctx, "owner", "turn-1", "checkpoint", task_id=task_id)["phase"] == "review_due"
 
 
+@pytest.mark.parametrize("wrapper", ["raw", "fenced", "prose"])
 @pytest.mark.parametrize("change", [None, "wrong_revision", "missing_findings", "extra_key", "wrong_type", "bad_verdict"])
-def test_schema_less_json_requires_exact_valid_contract(registered_plugin, tmp_path, change):
+def test_schema_less_json_requires_exact_valid_contract(registered_plugin, tmp_path, change, wrapper):
     ctx = registered_plugin
     root = repo(tmp_path)
     task_id = active(ctx, root)
@@ -359,7 +360,12 @@ def test_schema_less_json_requires_exact_valid_contract(registered_plugin, tmp_p
     if change == "extra_key": verdict["unexpected"] = "no"
     if change == "wrong_type": verdict["findings"] = []
     if change == "bad_verdict": verdict["verdict"] = "approved"
-    event["results"][0]["summary"] = json.dumps(verdict)
+    summary = json.dumps(verdict)
+    if wrapper == "fenced":
+        summary = f"```json\n{summary}\n```"
+    elif wrapper == "prose":
+        summary = f"Review result:\n{summary}\nEnd of review."
+    event["results"][0]["summary"] = summary
     ledger(tmp_path, "review-1", event)
     assert plugin._review_completion("review-1", "owner") is (change is None)
     task = plugin._review_task("owner", task_id)
@@ -403,7 +409,7 @@ def test_core_review_rechecks_revision_before_launch(captured_core_entrypoint, t
     invoke(ctx, "owner", "turn-1", "checkpoint", task_id=task_id)
     p = parent()
     p.session_id, p._current_turn_id, p.platform, p._delegate_depth = "owner", "turn-1", "slack", 0
-    lane = {"label": "independent", "phase": "worker", "model": "gpt-6.1-sol",
+    lane = {"label": "independent", "phase": "worker", "work_type": "verification", "model": "gpt-6.1-sol",
             "reasoning_effort": "high", "toolsets": ["file"]}
     route = json.loads(ctx.tools["route_turn"]({"mode": "single", "reason": "review checkpoint",
                                                "review_task_id": task_id, "lanes": [lane]}, parent_agent=p))
@@ -414,3 +420,148 @@ def test_core_review_rechecks_revision_before_launch(captured_core_entrypoint, t
     result = json.loads(native.delegate_task(tasks=[task], parent_agent=p))
     assert "review artifact changed before reviewer launch" in result["error"]
     assert captured == {} and plugin._review_task("owner", task_id)["phase"] == "review_due"
+
+
+@pytest.mark.parametrize("schema_valid", [True, None])
+@pytest.mark.parametrize("kind", ["pass", "fail", "wrong_revision", "prose", "artifact_changed", "same_child", "wrong_extension"])
+def test_fenced_review_verdict_and_authentication(registered_plugin, tmp_path, schema_valid, kind):
+    ctx = registered_plugin
+    root = repo(tmp_path)
+    task_id = active(ctx, root)
+    revision = invoke(ctx, "owner", "turn-1", "checkpoint", task_id=task_id)["revision"]
+    task = plugin._review_task("owner", task_id)
+    task.update(phase="review_pending", delegation_id="review-fenced")
+    plugin._save_review(task)
+    event = reviewer_event(revision, schema_valid=schema_valid)
+    result = event["results"][0]
+    verdict = {"verdict": "fail" if kind == "fail" else "pass",
+               "revision": "other" if kind == "wrong_revision" else revision,
+               "findings": "Missing regression coverage" if kind == "fail" else "none"}
+    result["summary"] = f"```json\n{json.dumps(verdict)}\n```"
+    if kind == "prose":
+        result["summary"] = "Review complete, everything looks fine."
+    if kind == "artifact_changed":
+        (root / "artifact.txt").write_text("changed during fenced review\n")
+    if kind == "same_child":
+        result["routing"]["child_session_id"] = "owner"
+    if kind == "wrong_extension":
+        result["routing"]["extension"] = "forged-plugin@0.3.3"
+    ledger(tmp_path, "review-fenced", event)
+    assert plugin._review_completion("review-fenced", "owner") is (kind == "pass")
+    reviewed = plugin._review_task("owner", task_id)
+    assert reviewed["phase"] == ("reviewed" if kind == "pass" else "review_failed")
+    assert reviewed["reviewed_revision"] == (revision if kind == "pass" else None)
+    if kind == "fail":
+        assert reviewed["findings"] == "Missing regression coverage"
+    if kind == "prose":
+        assert reviewed["review_failure_reason"] == "검토 결과를 읽을 수 없습니다"
+
+
+def test_live_slack_fenced_summary_shape_is_reviewed(registered_plugin, tmp_path):
+    """Reproduce deleg_f6a6dc76's JSON fence/key ordering with an isolated revision."""
+    from tools.delegation_output_schema import extract_json_candidate, validate_output
+    assert plugin.extract_json_candidate is extract_json_candidate
+    ctx = registered_plugin
+    root = repo(tmp_path)
+    sid, did = "20261007_031955_b4dc8104", "deleg_f6a6dc76"
+    task_id = active(ctx, root, sid=sid)
+    revision = invoke(ctx, sid, "turn-1", "checkpoint", task_id=task_id)["revision"]
+    task = plugin._review_task(sid, task_id)
+    task.update(phase="review_pending", delegation_id=did)
+    plugin._save_review(task)
+    event = reviewer_event(revision)
+    result = event["results"][0]
+    result["routing"]["actual_model"] = "claude-opus-5"
+    result["summary"] = f'```json\n{{"verdict": "pass", "revision": "{revision}", "findings": "none"}}\n```'
+    assert validate_output(result["summary"], plugin._REVIEW_SCHEMA) == (True, [])
+    ledger(tmp_path, did, event, owner=sid)
+    assert plugin._review_completion(did, sid) is True
+    reviewed = plugin._review_task(sid, task_id)
+    assert reviewed["phase"] == "reviewed" and reviewed["reviewed_revision"] == revision
+
+
+@pytest.mark.parametrize("text", [
+    None, "", "plain prose", '{"verdict":"pass"}', '[1, 2]',
+    '```json\n{"verdict":"pass"}\n```', '```\njson\n{"verdict":"pass"}\n```',
+    '```JSON\n{"verdict":"pass"}\n```', '```\n[1, 2]\n```',
+    'Before {"nested":{"value":"}"}} after', 'Before [1, 2] after',
+    '```json\n{"verdict":"pass"}\n```\nTrailing prose',
+    '{"verdict":"pass"} trailing prose', 'Before {"x":1} between {"x":2} after',
+])
+def test_json_extraction_fallback_matches_installed_core(monkeypatch, text):
+    import builtins
+    import importlib.util
+    from tools.delegation_output_schema import extract_json_candidate
+    original_import = builtins.__import__
+
+    def without_extractor(name, *args, **kwargs):
+        if name == "tools.delegation_output_schema":
+            raise ImportError("simulate older core without extraction helper")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_extractor)
+    spec = importlib.util.spec_from_file_location("routing_extraction_fallback", plugin.__file__)
+    assert spec and spec.loader
+    fallback = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fallback)
+    assert fallback.extract_json_candidate.__module__ == "routing_extraction_fallback"
+    assert fallback.extract_json_candidate(text) == extract_json_candidate(text)
+
+
+def test_single_checkpoint_verifier_is_normalized_and_dispatched(captured_core_entrypoint, tmp_path):
+    import tools.delegate_tool as native
+    ctx, captured = captured_core_entrypoint
+    root = repo(tmp_path)
+    task_id = active(ctx, root)
+    invoke(ctx, "owner", "turn-1", "checkpoint", task_id=task_id)
+    p = parent()
+    p.session_id, p._current_turn_id, p.platform, p._delegate_depth = "owner", "turn-1", "slack", 0
+    lane = {"label": "independent", "phase": "verifier", "work_type": "verification", "model": "gpt-6.1-sol",
+            "reasoning_effort": "high", "toolsets": ["file"]}
+    payload = {"mode": "single", "reason": "review checkpoint", "review_task_id": task_id, "lanes": [lane]}
+    route = json.loads(ctx.tools["route_turn"](payload, parent_agent=p))
+    assert route["status"] == "accepted"
+    plan = plugin._TURN_PLANS[plugin._turn_key("owner", "turn-1")]
+    assert plan["lanes"][0]["phase"] == "worker"
+    assert plan["expected_lanes"] == plan["lanes"]
+    assert lane["phase"] == "verifier"  # normalize the plan, not caller input
+    dispatched = {key: value for key, value in lane.items() if key != "phase"}
+    dispatched["goal"] = "review artifact"
+    assert json.loads(native.delegate_task(tasks=[dispatched], parent_agent=p))["delegation_id"] == "review-1"
+    assert captured["tasks"][0]["output_schema"] == plugin._REVIEW_SCHEMA
+    assert plugin._review_task("owner", task_id)["phase"] == "review_pending"
+    description = plugin.ROUTE_TURN_SCHEMA["parameters"]["properties"]["review_task_id"]["description"]
+    assert "worker or verifier" in description
+    assert "worker or verifier" in plugin.ROUTE_TURN_SCHEMA["description"]
+
+
+@pytest.mark.parametrize("kind, error", [
+    ("no_review_id", "single mode accepts worker lanes only"),
+    ("high_risk", "worker_verifier is required for this high-risk turn"),
+    ("unowned_checkpoint", "owned development checkpoint is not review_due"),
+    ("two_lanes", "single mode requires exactly one lane"),
+    ("parallel", "parallel mode accepts worker lanes only"),
+])
+def test_checkpoint_verifier_exception_does_not_relax_other_guards(registered_plugin, tmp_path, monkeypatch, kind, error):
+    ctx = registered_plugin
+    root = repo(tmp_path)
+    task_id = active(ctx, root)
+    invoke(ctx, "owner", "turn-1", "checkpoint", task_id=task_id)
+    key = plugin._turn_key("owner", "turn-1")
+    monkeypatch.setitem(plugin._TURN_RISK_REQUIREMENTS, key, kind == "high_risk")
+    before = copy.deepcopy(plugin._TURN_PLANS[key])
+    lane = {"label": "reviewer", "phase": "verifier", "work_type": "verification", "model": "gpt-6.1-sol",
+            "reasoning_effort": "high", "toolsets": ["file"]}
+    payload = {"mode": "single", "reason": "review checkpoint", "review_task_id": task_id, "lanes": [lane]}
+    if kind == "no_review_id":
+        payload.pop("review_task_id")
+    if kind == "unowned_checkpoint":
+        payload["review_task_id"] = "unknown-checkpoint"
+    if kind in {"two_lanes", "parallel"}:
+        payload["lanes"].append({**lane, "label": "other"})
+    if kind == "parallel":
+        payload["mode"] = "parallel"
+    result = json.loads(ctx.tools["route_turn"](payload, session_id="owner", turn_id="turn-1"))
+    assert error in result["error"]
+    assert plugin._TURN_PLANS[key] == before
+    assert plugin._review_task("owner", task_id)["phase"] == "review_due"

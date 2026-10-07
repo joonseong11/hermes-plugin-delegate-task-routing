@@ -1,5 +1,5 @@
 name: delegate-task-routing
-version: 0.3.2
+version: 0.4.0
 description: "Strict per-turn orchestration policy, per-task routing, actual-route attribution, and deterministic Alex headers."
 author: handybus-agent-alex
 license: MIT
