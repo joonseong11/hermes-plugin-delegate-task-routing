@@ -189,8 +189,14 @@ ROUTE_TURN_SCHEMA = {
         "General implementation uses single with tests in the same worker lane; "
         "the parent reviews the evidence. No verification stage runs automatically. "
         "Add a verification lane only when the user explicitly asks for an "
-        "independent check or review; it is an ordinary single or parallel lane "
-        "with work_type=verification. Small reversible local edits can stay direct. "
+        "independent check or review of something that already exists; it is an "
+        "ordinary lane with work_type=verification. A review depends on the work "
+        "it reviews: never put a review in the same parallel plan as that work, "
+        "and a completion turn cannot dispatch further lanes. When one message "
+        "asks for work and an independent review of it, delegate the work only, "
+        "and say in the final answer that the review has not run and can be "
+        "requested in a follow-up message. "
+        "Small reversible local edits can stay direct. "
         "For a user-requested skill refresh, choose direct with empty lanes, then call "
         "skill_view for the changed skills before planning or editing; do not delegate "
         "merely to reload skills. If refreshed instructions reveal a larger scope, "
@@ -1044,21 +1050,24 @@ def _claim_completion_once(delegation_id: str, session_id: str, turn_id: str) ->
 
     The durable stage makes replays fail closed across restarts. Records left in
     a dispatched stage by the pre-0.5.0 worker/verifier chain are claimed once
-    as ordinary completions.
+    as ordinary completions; ``claimed_from_stage`` names that legacy stage.
     """
     with _POLICY_LOCK:
         records = _durable_delegations()
         current = records.get(delegation_id)
+        legacy_stage = ""
         if isinstance(current, Mapping):
             record = dict(current)
             if not _owned_session(str(record.get("parent_session_id") or ""), session_id):
                 return None
-            if str(record.get("stage") or "") not in {"workers_dispatched", "verifiers_dispatched"}:
+            legacy_stage = str(record.get("stage") or "")
+            if legacy_stage not in {"workers_dispatched", "verifiers_dispatched"}:
                 return None
         else:
             record = {"parent_session_id": session_id, "created_at": time.time()}
         record.update(stage="completion_consumed", claimed_turn_id=turn_id, updated_at=time.time())
         _persist_delegation_policy(delegation_id, record)
+        record["claimed_from_stage"] = legacy_stage
         return record
 
 
@@ -1233,6 +1242,14 @@ def _pre_llm_policy(**kwargs: Any) -> Any:
                 "delegation_id": delegation_id, "created_at": time.time(),
             }
         return {"context": "This authenticated async completion was already consumed. Do not dispatch or answer it again."}
+    owned_delegation_ids = [delegation_id]
+    if record.get("claimed_from_stage") == "verifiers_dispatched":
+        # A pre-0.5.0 verifier delegation that was in flight at upgrade: keep
+        # the attribution of the workers that ran before it.
+        actual = list(record.get("prior_routes") or []) + actual
+        source_delegation_id = str(record.get("source_delegation_id") or "").strip()
+        if source_delegation_id and source_delegation_id not in owned_delegation_ids:
+            owned_delegation_ids.insert(0, source_delegation_id)
     with _POLICY_LOCK:
         _TURN_PLANS[_turn_key(session_id, turn_id)] = {
             "mode": "completion",
@@ -1241,7 +1258,7 @@ def _pre_llm_policy(**kwargs: Any) -> Any:
             "actual_routes": actual,
             "dispatched": True,
             "delegation_id": delegation_id,
-            "owned_delegation_ids": [delegation_id],
+            "owned_delegation_ids": owned_delegation_ids,
             "created_at": time.time(),
         }
     if actual:

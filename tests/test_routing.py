@@ -845,8 +845,9 @@ def test_legacy_dispatched_chain_is_claimed_once_as_ordinary_completion(monkeypa
     plugin._PLUGIN_STATE.set("delegations", {"deleg-legacy": {
         "stage": stage, "parent_session_id": "parent", "created_at": 1,
         "lanes": [{"label": "기술검수", "phase": "verifier"}],
+        "prior_routes": [_completed_route("구현")], "source_delegation_id": "deleg-source",
     }})
-    monkeypatch.setattr(plugin, "_verified_completion_routes", lambda *_: [_completed_route()])
+    monkeypatch.setattr(plugin, "_verified_completion_routes", lambda *_: [_completed_route("기술검수")])
     context = dict(task_id="parent-task", platform="slack", parent_session_id="",
                    user_message="[ASYNC DELEGATION BATCH COMPLETE — deleg-legacy]")
     plugin._pre_llm_policy(session_id="other-parent", turn_id="foreign", **context)
@@ -854,7 +855,12 @@ def test_legacy_dispatched_chain_is_claimed_once_as_ordinary_completion(monkeypa
     plugin._pre_llm_policy(session_id="parent", turn_id="legacy-turn", **context)
     plan = plugin._TURN_PLANS[plugin._turn_key("parent", "legacy-turn")]
     assert plan["mode"] == "completion" and plan["dispatched"] is True
-    assert plugin._PLUGIN_STATE.get("delegations")["deleg-legacy"]["stage"] == "completion_consumed"
+    # Only a legacy verifier completion carries the workers that ran before it.
+    chained = stage == "verifiers_dispatched"
+    assert [x["label"] for x in plan["actual_routes"]] == (["구현", "기술검수"] if chained else ["기술검수"])
+    assert plan["owned_delegation_ids"] == (["deleg-source", "deleg-legacy"] if chained else ["deleg-legacy"])
+    saved = plugin._PLUGIN_STATE.get("delegations")["deleg-legacy"]
+    assert saved["stage"] == "completion_consumed" and "claimed_from_stage" not in saved
     plugin._pre_llm_policy(session_id="parent", turn_id="legacy-replay", **context)
     assert plugin._TURN_PLANS[plugin._turn_key("parent", "legacy-replay")]["mode"] == "policy_error"
 
@@ -1441,6 +1447,10 @@ def test_route_turn_schema_has_no_automatic_verification():
     assert "tests in the same worker lane" in description
     assert "not implementation plus its tests" in description
     assert "only when the user explicitly asks" in description
+    # A dependent review is never planned alongside the work it reviews.
+    assert "never put a review in the same parallel plan as that work" in description
+    assert "delegate the work only" in description
+    assert "requested in a follow-up message" in description
     for removed in ("worker_verifier", "development_review", "review_task_id", "phase=verifier"):
         assert removed not in description
     properties = plugin.ROUTE_TURN_SCHEMA["parameters"]["properties"]

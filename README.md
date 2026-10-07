@@ -24,7 +24,9 @@ Every normal Slack parent turn must call `route_turn` first. LLM request middlew
 
 The plugin never adds a verification or review stage on its own. Earlier versions forced a second verifier delegation when the request wording matched high-risk keywords (`worker_verifier`), and opened a repository-fingerprint review gate for requests that looked like development work (`development_review`). Both were removed in v0.5.0, together with the keyword classifiers that triggered them.
 
-Verification is now requested by the person who needs it. When a user asks for an independent check or review, the parent routes it as an ordinary `single` or `parallel` lane with `work_type=verification`, which still uses the fixed verification model. Nothing blocks or annotates a final answer for lack of a review.
+Verification is now requested by the person who needs it. When a user asks for an independent check or review, the parent routes it as an ordinary lane with `work_type=verification`, which still uses the fixed verification model. Nothing blocks or annotates a final answer for lack of a review.
+
+A review can only cover work that already exists. The plugin has no sequential mode, and a completion turn cannot dispatch further lanes, so work and a review of that work cannot run from one message: the guidance tells the parent to delegate the work only and to say that the review has not run. The user asks for the review in a follow-up message once the work is back.
 
 Records written by earlier versions are handled as follows. A delegation left in a `workers_dispatched` or `verifiers_dispatched` stage is accepted once as an ordinary completion; no verifier is dispatched for it. The `development_reviews` plugin-state key is no longer read or written.
 

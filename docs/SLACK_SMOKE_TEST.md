@@ -53,7 +53,9 @@ Pass conditions:
 3. The final answer carries no `검토 대기` / `검토 중` / `검토 실패` prefix.
 4. `development_review` is not present in the session's tool list.
 
-Then ask explicitly for an independent check of a harmless result. It must run as one ordinary lane with `work_type=verification` on the fixed verification model, and the header names that lane.
+Then, in a follow-up message, ask explicitly for an independent check of a harmless result that already exists. It must run as one ordinary lane with `work_type=verification` on the fixed verification model, and the header names that lane.
+
+Finally ask for a harmless piece of work and an independent review of it in one message. The work must be delegated alone, with no verification lane in the same plan, and the final answer must say that the review has not run.
 
 If smoke fails, restore only the verified pre-change plugin payload in place, leaving the checkout's `.git` intact; never run `rollback.sh --apply` against this live checkout. An older backup (`/opt/data/plugins/.delegate-task-routing.backup-20260922T075725Z`) contains v0.2.9, **not** the exact pre-edit v0.3.0 and must not be represented as an exact rollback. If no verified pre-change payload exists, leave restart blocked or arrange an independently tested rollback package first. Restart externally after a safe session snapshot and repeat a fresh direct + review smoke. A passed local test is not live activation.
 
