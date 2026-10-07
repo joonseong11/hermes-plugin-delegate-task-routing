@@ -83,4 +83,4 @@ COMMITTED=1
 trap - EXIT
 printf 'deployment file comparison: PASS\n'
 [[ -d "$BACKUP" ]] && printf 'rollback backup: %s\n' "$BACKUP"
-printf 'Gateway restart is intentionally not automatic. After an independently reviewed diff, safe session-store snapshot and active-child check, restart from an EXTERNAL host shell; then follow docs/SLACK_SMOKE_TEST.md.\n'
+printf 'Gateway restart is intentionally not automatic. After an independently reviewed diff, a check that the scheduled state.db backup is current (if it is stale or absent, take a consistent backup first as described in docs/SLACK_SMOKE_TEST.md) and an active-child check, restart from an EXTERNAL host shell; then follow docs/SLACK_SMOKE_TEST.md.\n'
