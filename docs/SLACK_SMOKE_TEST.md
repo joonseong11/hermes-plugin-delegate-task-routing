@@ -57,7 +57,7 @@ Then, in a follow-up message, ask explicitly for an independent check of a harml
 
 Finally ask for a harmless piece of work and an independent review of it in one message. The work must be delegated alone, with no verification lane in the same plan, and the final answer must say that the review has not run.
 
-If smoke fails, restore only the verified pre-change plugin payload in place, leaving the checkout's `.git` intact; never run `rollback.sh --apply` against this live checkout. An older backup (`/opt/data/plugins/.delegate-task-routing.backup-20260922T075725Z`) contains v0.2.9, **not** the exact pre-edit v0.3.0 and must not be represented as an exact rollback. If no verified pre-change payload exists, leave restart blocked or arrange an independently tested rollback package first. Restart externally after a safe session snapshot and repeat a fresh direct + review smoke. A passed local test is not live activation.
+If smoke fails, restore only the verified pre-change plugin payload in place, leaving the checkout's `.git` intact; never run `rollback.sh --apply` against this live checkout. An older backup (`/opt/data/plugins/.delegate-task-routing.backup-20260922T075725Z`) contains v0.2.9, **not** the exact pre-edit v0.3.0 and must not be represented as an exact rollback. If no verified pre-change payload exists, leave restart blocked or arrange an independently tested rollback package first. Restart externally and repeat a fresh direct + review smoke. A passed local test is not live activation.
 
 ## Failure handling
 
