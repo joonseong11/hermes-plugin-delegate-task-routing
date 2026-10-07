@@ -537,7 +537,7 @@ def test_missing_routing_fields_fail_closed():
         unload()
 
 
-def test_route_plan_modes_and_worker_verifier_phases():
+def test_route_plan_modes_reject_removed_worker_verifier():
     direct = plugin._validate_plan(
         {"mode": "direct", "reason": "one step", "lanes": []},
         allowed_models=settings("allowed_models"),
@@ -547,99 +547,61 @@ def test_route_plan_modes_and_worker_verifier_phases():
     assert direct["mode"] == "direct"
     worker = {
         "label": "작업",
-        "phase": "worker", "work_type": "mechanical",
+        "work_type": "mechanical",
         "model": "gpt-5.6-terra-900k",
         "reasoning_effort": "high",
         "toolsets": ["file"],
     }
-    verifier = {
+    requested_check = {
         "label": "기술검수",
-        "phase": "verifier", "work_type": "verification",
+        "work_type": "verification",
         "model": "gpt-6.1-sol",
         "reasoning_effort": "high",
         "toolsets": ["file"],
     }
+    with pytest.raises(ValueError, match="mode must be direct, single, or parallel"):
+        plugin._validate_plan(
+            {"mode": "worker_verifier", "reason": "consequential change",
+             "lanes": [worker, requested_check]},
+            allowed_models=settings("allowed_models"),
+            allowed_efforts=settings("allowed_reasoning_efforts"),
+            allowed_toolsets=settings("allowed_toolsets"),
+        )
+    # A verification the user asked for is an ordinary lane.
     plan = plugin._validate_plan(
-        {
-            "mode": "worker_verifier",
-            "reason": "consequential change",
-            "lanes": [worker, verifier],
-        },
+        {"mode": "single", "reason": "user asked for a check", "lanes": [requested_check]},
         allowed_models=settings("allowed_models"),
         allowed_efforts=settings("allowed_reasoning_efforts"),
         allowed_toolsets=settings("allowed_toolsets"),
     )
-    assert {lane["phase"] for lane in plan["lanes"]} == {"worker", "verifier"}
+    assert plan["lanes"] == [requested_check]
 
 
-def test_worker_verifier_is_forced_only_at_the_high_risk_boundary():
-    ordinary = (
-        "Summarize these local notes and update a draft.",
-        "로컬 코드 수정 후 테스트를 실행해줘",
-    )
-    high_risk = (
-        "Write the approved update to the external system.",
-        "Handle the deployments.",
-        "Change production configuration.",
-        "Transfer funds.",
-        "Complete the accounting close.",
-        "Review this legal decision.",
-        "Perform a security change.",
-        "Change the team permissions.",
-        "Perform this irreversible action.",
-        "This ambiguous task has high error cost.",
-        "외부 시스템에 변경 사항을 기록해줘.",
-        "프로덕션 배포 전 독립 검증을 해줘",
-        "Publish the approved response to the external channel",
-    )
-    assert all(plugin._worker_verifier_requirement(text) is False for text in ordinary)
-    assert all(plugin._worker_verifier_requirement(text) is True for text in high_risk)
-    assert plugin._worker_verifier_requirement("Handle this unusual sensitive change carefully.") is None
-
-    direct = {"mode": "direct", "reason": "routine", "lanes": []}
-    with pytest.raises(ValueError, match="required for this high-risk"):
-        plugin._validate_plan(
-            direct,
-            allowed_models=settings("allowed_models"),
-            allowed_efforts=settings("allowed_reasoning_efforts"),
-            allowed_toolsets=settings("allowed_toolsets"),
-            require_worker_verifier=True,
-        )
-
-    worker = {
-        "label": "작업",
-        "phase": "worker", "work_type": "mechanical",
-        "model": "gpt-5.6-terra-900k",
-        "reasoning_effort": "high",
-        "toolsets": ["file"],
-    }
-    verifier = {
-        "label": "검수",
-        "phase": "verifier", "work_type": "verification",
-        "model": "gpt-6.1-sol",
-        "reasoning_effort": "high",
-        "toolsets": ["file"],
-    }
-    worker_verifier = {
-        "mode": "worker_verifier",
-        "reason": "production deployment",
-        "lanes": [worker, verifier],
-    }
-    assert plugin._validate_plan(
-        worker_verifier,
+@pytest.mark.parametrize("message", [
+    "Handle the deployments.",
+    "Change production configuration.",
+    "Transfer funds.",
+    "Change the team permissions.",
+    "프로덕션 배포 전 독립 검증을 해줘",
+    "로컬 코드 수정 후 버그를 구현해줘",
+])
+def test_request_wording_never_forces_verification_or_review(message):
+    plugin._PLUGIN_STATE = FakeState()
+    context = dict(session_id="wording", turn_id="wording-turn", task_id="parent-task",
+                   platform="slack", parent_session_id="")
+    key = plugin._turn_key("wording", "wording-turn")
+    with plugin._POLICY_LOCK:
+        plugin._TURN_PLANS.pop(key, None)
+    assert plugin._pre_llm_policy(user_message=message, **context) is None
+    assert key not in plugin._TURN_PLANS
+    assert plugin._PLUGIN_STATE.get("development_reviews", None) is None
+    direct = plugin._validate_plan(
+        {"mode": "direct", "reason": "routine", "lanes": []},
         allowed_models=settings("allowed_models"),
         allowed_efforts=settings("allowed_reasoning_efforts"),
         allowed_toolsets=settings("allowed_toolsets"),
-        require_worker_verifier=True,
-    )["mode"] == "worker_verifier"
-    with pytest.raises(ValueError, match="reserved for high-risk"):
-        plugin._validate_plan(
-            worker_verifier,
-            allowed_models=settings("allowed_models"),
-            allowed_efforts=settings("allowed_reasoning_efforts"),
-            allowed_toolsets=settings("allowed_toolsets"),
-            require_worker_verifier=False,
-        )
+    )
+    assert direct["mode"] == "direct"
 
 
 def test_llm_request_policy_forces_route_then_delegate():
@@ -733,7 +695,7 @@ def test_non_parent_scopes_are_not_gated_or_headered():
 def test_duplicate_lane_labels_fail_closed():
     lane = {
         "label": "검수",
-        "phase": "worker", "work_type": "mechanical",
+        "work_type": "mechanical",
         "model": "gpt-5.6-luna-900k",
         "reasoning_effort": "low",
         "toolsets": ["file"],
@@ -758,7 +720,7 @@ def test_declared_plan_must_match_delegate_tasks():
     key = plugin._turn_key(p.session_id, p._current_turn_id)
     lane = {
         "label": "자료수집",
-        "phase": "worker", "work_type": "mechanical",
+        "work_type": "mechanical",
         "model": "gpt-5.6-luna-900k",
         "reasoning_effort": "low",
         "toolsets": ["web"],
@@ -817,123 +779,90 @@ def test_header_is_deterministic_and_discloses_fallback():
     )
 
 
-def test_worker_verifier_is_sequenced_across_async_completions(monkeypatch):
+def _completed_route(label="구현"):
+    return {
+        "label": label,
+        "requested_model": "claude-opus-5",
+        "requested_reasoning_effort": "high",
+        "actual_model": "claude-opus-5",
+        "actual_reasoning_effort": "high",
+        "status": "completed",
+        "completed": True,
+    }
+
+
+def test_worker_completion_is_final_and_replay_fails_closed(monkeypatch):
     plugin._PLUGIN_STATE = FakeState()
     worker = {
         "label": "구현",
-        "phase": "worker", "work_type": "implementation",
+        "work_type": "implementation",
         "model": "claude-opus-5",
         "reasoning_effort": "high",
         "toolsets": ["file"],
     }
-    verifier = {
-        "label": "기술검수",
-        "phase": "verifier", "work_type": "verification",
-        "model": "gpt-6.1-sol",
-        "reasoning_effort": "high",
-        "toolsets": ["file"],
-    }
     plan = plugin._validate_plan(
-        {
-            "mode": "worker_verifier",
-            "reason": "write and verify",
-            "lanes": [worker, verifier],
-        },
+        {"mode": "single", "reason": "write", "lanes": [worker]},
         allowed_models=settings("allowed_models"),
         allowed_efforts=settings("allowed_reasoning_efforts"),
         allowed_toolsets=settings("allowed_toolsets"),
     )
     plan["parent_session_id"] = "parent"
-    assert plan["expected_lanes"] == [worker]
     plugin._mark_delegation_dispatch(plan, {"delegation_id": "deleg-workers"})
-
-    def actual_routes(delegation_id):
-        if delegation_id == "deleg-workers":
-            return [
-                {
-                    "label": "구현",
-                    "requested_model": "claude-opus-5",
-                    "requested_reasoning_effort": "high",
-                    "actual_model": "claude-opus-5",
-                    "actual_reasoning_effort": "high",
-                    "status": "completed",
-                    "completed": True,
-                }
-            ]
-        return [
-            {
-                "label": "기술검수",
-                "requested_model": "gpt-6.1-sol",
-                "requested_reasoning_effort": "high",
-                "actual_model": "gpt-6.1-sol",
-                "actual_reasoning_effort": "high",
-                "status": "completed",
-                "completed": True,
-            }
-        ]
+    assert plan["dispatched"] is True
+    assert plugin._PLUGIN_STATE.get("delegations", None) is None
 
     monkeypatch.setattr(
         plugin,
         "_verified_completion_routes",
-        lambda delegation_id, session_id: actual_routes(delegation_id)
-        if session_id == "parent"
-        else [],
+        lambda delegation_id, session_id: [_completed_route()] if session_id == "parent" else [],
     )
+    context = dict(session_id="parent", task_id="parent-task", platform="slack")
     plugin._pre_llm_policy(
-        session_id="parent",
-        turn_id="verify-turn",
-        task_id="parent-task",
-        platform="slack",
-        parent_session_id="",
-        user_message="[ASYNC DELEGATION BATCH COMPLETE — deleg-workers]",
-    )
-    verify_plan = plugin._TURN_PLANS[plugin._turn_key("parent", "verify-turn")]
-    assert verify_plan["mode"] == "verification"
-    assert verify_plan["expected_lanes"] == [verifier]
-    assert plugin.delegation_lifecycle_for_turn("parent", "verify-turn") == {
-        "mode": "verification", "delegation_ids": ["deleg-workers"], "dispatched": False,
-    }
-    plugin._pre_llm_policy(
-        session_id="parent", turn_id="replayed-worker", task_id="parent-task",
-        platform="slack", parent_session_id="",
-        user_message="[ASYNC DELEGATION BATCH COMPLETE — deleg-workers]",
-    )
-    assert plugin._TURN_PLANS[plugin._turn_key("parent", "replayed-worker")]["mode"] == "policy_error"
-    forced = plugin._llm_request_policy(
-        {"input": []},
-        session_id="parent",
-        turn_id="verify-turn",
-        task_id="parent-task",
-        platform="slack",
-        api_mode="codex_responses",
-    )
-    assert forced["request"]["tool_choice"]["name"] == "delegate_task"
-    plugin._mark_delegation_dispatch(
-        verify_plan, {"delegation_id": "deleg-verifiers"}
-    )
-    plugin._pre_llm_policy(
-        session_id="parent",
-        turn_id="final-turn",
-        task_id="parent-task",
-        platform="slack",
-        parent_session_id="",
-        user_message="[ASYNC DELEGATION BATCH COMPLETE — deleg-verifiers]",
+        turn_id="final-turn", parent_session_id="",
+        user_message="[ASYNC DELEGATION BATCH COMPLETE — deleg-workers]", **context,
     )
     final_plan = plugin._TURN_PLANS[plugin._turn_key("parent", "final-turn")]
     assert final_plan["mode"] == "completion"
-    assert [x["label"] for x in final_plan["actual_routes"]] == ["구현", "기술검수"]
-    assert final_plan["owned_delegation_ids"] == ["deleg-workers", "deleg-verifiers"]
+    assert [x["label"] for x in final_plan["actual_routes"]] == ["구현"]
     assert plugin.delegation_lifecycle_for_turn("parent", "final-turn") == {
-        "mode": "completion",
-        "delegation_ids": ["deleg-workers", "deleg-verifiers"],
-        "dispatched": True,
+        "mode": "completion", "delegation_ids": ["deleg-workers"], "dispatched": True,
     }
+    # No verifier dispatch is forced after the workers return.
+    assert plugin._llm_request_policy(
+        {"input": []}, turn_id="final-turn", api_mode="codex_responses", **context,
+    ) is None
+    assert plugin._pre_tool_policy("terminal", turn_id="final-turn", **context) is None
     plugin._pre_llm_policy(
-        session_id="parent", turn_id="replayed-verifier", task_id="parent-task",
-        platform="slack", parent_session_id="",
-        user_message="[ASYNC DELEGATION BATCH COMPLETE — deleg-verifiers]",
+        turn_id="replayed", parent_session_id="",
+        user_message="[ASYNC DELEGATION BATCH COMPLETE — deleg-workers]", **context,
     )
-    assert plugin._TURN_PLANS[plugin._turn_key("parent", "replayed-verifier")]["mode"] == "policy_error"
+    assert plugin._TURN_PLANS[plugin._turn_key("parent", "replayed")]["mode"] == "policy_error"
+
+
+@pytest.mark.parametrize("stage", ["workers_dispatched", "verifiers_dispatched"])
+def test_legacy_dispatched_chain_is_claimed_once_as_ordinary_completion(monkeypatch, stage):
+    plugin._PLUGIN_STATE = FakeState()
+    plugin._PLUGIN_STATE.set("delegations", {"deleg-legacy": {
+        "stage": stage, "parent_session_id": "parent", "created_at": 1,
+        "lanes": [{"label": "기술검수", "phase": "verifier"}],
+        "prior_routes": [_completed_route("구현")], "source_delegation_id": "deleg-source",
+    }})
+    monkeypatch.setattr(plugin, "_verified_completion_routes", lambda *_: [_completed_route("기술검수")])
+    context = dict(task_id="parent-task", platform="slack", parent_session_id="",
+                   user_message="[ASYNC DELEGATION BATCH COMPLETE — deleg-legacy]")
+    plugin._pre_llm_policy(session_id="other-parent", turn_id="foreign", **context)
+    assert plugin._TURN_PLANS[plugin._turn_key("other-parent", "foreign")]["mode"] == "policy_error"
+    plugin._pre_llm_policy(session_id="parent", turn_id="legacy-turn", **context)
+    plan = plugin._TURN_PLANS[plugin._turn_key("parent", "legacy-turn")]
+    assert plan["mode"] == "completion" and plan["dispatched"] is True
+    # Only a legacy verifier completion carries the workers that ran before it.
+    chained = stage == "verifiers_dispatched"
+    assert [x["label"] for x in plan["actual_routes"]] == (["구현", "기술검수"] if chained else ["기술검수"])
+    assert plan["owned_delegation_ids"] == (["deleg-source", "deleg-legacy"] if chained else ["deleg-legacy"])
+    saved = plugin._PLUGIN_STATE.get("delegations")["deleg-legacy"]
+    assert saved["stage"] == "completion_consumed" and "claimed_from_stage" not in saved
+    plugin._pre_llm_policy(session_id="parent", turn_id="legacy-replay", **context)
+    assert plugin._TURN_PLANS[plugin._turn_key("parent", "legacy-replay")]["mode"] == "policy_error"
 
 
 def test_lifecycle_contract_does_not_expose_route_payloads():
@@ -949,19 +878,20 @@ def test_lifecycle_contract_does_not_expose_route_payloads():
     }
 
 
-def test_retention_never_prunes_live_verification_chains():
+def test_retention_prunes_oldest_records_including_legacy_chains():
     plugin._PLUGIN_STATE = FakeState()
-    live = {
+    legacy = {
         f"live-{index}": {"stage": "workers_dispatched", "parent_session_id": "parent", "created_at": index}
         for index in range(101)
     }
-    plugin._PLUGIN_STATE.set("delegations", live)
+    plugin._PLUGIN_STATE.set("delegations", legacy)
     plugin._persist_delegation_policy(
-        "consumed", {"stage": "completion_consumed", "parent_session_id": "parent", "created_at": -1},
+        "newest", {"stage": "completion_consumed", "parent_session_id": "parent", "created_at": -1},
     )
     saved = dict(plugin._PLUGIN_STATE.get("delegations", {}) or {})
-    assert all(f"live-{index}" in saved for index in range(101))
-    assert "consumed" not in saved
+    assert len(saved) == 80
+    assert "newest" in saved and "live-100" in saved
+    assert "live-0" not in saved
 
 
 @pytest.mark.parametrize(
@@ -988,7 +918,7 @@ def test_forced_route_tool_is_declared_when_tool_search_deferred_it(
         assert len(rewritten_again["tools"]) == 1
 
 
-def test_unverified_async_marker_cannot_trigger_verification(monkeypatch):
+def test_unverified_async_marker_is_a_policy_error(monkeypatch):
     plugin._PLUGIN_STATE = FakeState()
     plugin._PLUGIN_STATE.set(
         "delegations",
@@ -1013,29 +943,21 @@ def test_unverified_async_marker_cannot_trigger_verification(monkeypatch):
     assert plan["mode"] == "policy_error"
 
 
-def test_worker_verifier_persistence_failure_is_fail_closed():
+def test_completion_claim_persistence_failure_is_fail_closed():
     class BrokenState(FakeState):
         def set(self, key, value):
             raise OSError("disk unavailable")
 
     plugin._PLUGIN_STATE = BrokenState()
-    plan = {
-        "mode": "worker_verifier",
-        "lanes": [],
-        "parent_session_id": "parent",
-        "dispatched": False,
-    }
-    with pytest.raises(RuntimeError, match="mandatory verification state"):
-        plugin._mark_delegation_dispatch(plan, {"delegation_id": "deleg-workers"})
-    assert plan["mode"] == "policy_error"
-    assert plan["dispatched"] is False
+    with pytest.raises(RuntimeError, match="completion state"):
+        plugin._claim_completion_once("deleg-workers", "parent", "turn")
 
 
 def test_bedrock_delegation_force_uses_tool_config():
     key = plugin._turn_key("bedrock-parent", "bedrock-turn")
     with plugin._POLICY_LOCK:
         plugin._TURN_PLANS[key] = {
-            "mode": "verification",
+            "mode": "single",
             "dispatched": False,
             "lanes": [],
         }
@@ -1201,6 +1123,123 @@ def test_forced_route_loop_breaker_bypasses_after_max_attempts():
     with plugin._POLICY_LOCK:
         assert plugin._TURN_PLANS[key]["mode"] == "policy_bypass"
         assert key not in plugin._FORCED_ROUTE_COUNTS
+
+
+def _pending_delegate_request(session_id, turn_id):
+    return plugin._llm_request_policy(
+        {"messages": []},
+        session_id=session_id,
+        turn_id=turn_id,
+        task_id="parent-task",
+        platform="slack",
+        api_mode="chat_completions",
+    )
+
+
+def test_forced_delegate_loop_breaker_releases_after_max_attempts():
+    plugin._ENFORCED_PLATFORMS = {"slack"}
+    session_id, turn_id = "delegate-loop-session", "delegate-loop-turn"
+    key = plugin._turn_key(session_id, turn_id)
+    with plugin._POLICY_LOCK:
+        plugin._TURN_PLANS[key] = {"mode": "single", "lanes": [], "dispatched": False}
+
+    # The plan never dispatches (rejected tasks, or list/steer/stop calls).
+    for attempt in range(plugin._MAX_FORCED_DELEGATE_ATTEMPTS):
+        forced = _pending_delegate_request(session_id, turn_id)
+        assert forced is not None, f"attempt {attempt} should force delegate_task"
+        assert forced["request"]["tool_choice"]["function"]["name"] == "delegate_task"
+
+    # Later requests are left alone so the parent can answer in text.
+    assert _pending_delegate_request(session_id, turn_id) is None
+    assert _pending_delegate_request(session_id, turn_id) is None
+    with plugin._POLICY_LOCK:
+        plan = plugin._TURN_PLANS[key]
+        # The declared plan stays in force; only the forced tool choice is dropped.
+        assert plan["mode"] == "single"
+        assert plan["delegate_forcing_released"] is True
+        assert plan["dispatched"] is False
+
+    agent = SimpleNamespace(session_id=session_id, _current_turn_id=turn_id)
+    assert plugin._delegate_forcing_exhausted(agent) is True
+    blocked = plugin._pre_tool_policy(
+        "terminal",
+        session_id=session_id,
+        turn_id=turn_id,
+        task_id="parent-task",
+        platform="slack",
+    )
+    assert blocked == {
+        "action": "block",
+        "message": plugin._DELEGATE_FORCING_RELEASED_NOTE,
+    }
+    for allowed in ("route_turn", "delegate_task"):
+        assert plugin._pre_tool_policy(
+            allowed,
+            session_id=session_id,
+            turn_id=turn_id,
+            task_id="parent-task",
+            platform="slack",
+        ) is None
+
+
+def test_released_undispatched_plan_header_does_not_claim_running_lanes():
+    plugin._ENFORCED_PLATFORMS = {"slack"}
+    session_id, turn_id = "delegate-header-session", "delegate-header-turn"
+    key = plugin._turn_key(session_id, turn_id)
+    lane = {"label": "환불액 계산", "model": "claude-opus-5", "reasoning_effort": "high"}
+    with plugin._POLICY_LOCK:
+        plugin._SKIP_HEADER_SESSIONS.discard(session_id)
+        plugin._TURN_PLANS[key] = {"mode": "single", "lanes": [lane], "dispatched": False}
+
+    def header():
+        return plugin._transform_header(
+            "위임이 거부되어 실행하지 못했습니다.",
+            session_id=session_id,
+            model="claude-opus-5",
+            turn_id=turn_id,
+        ).splitlines()[0]
+
+    # While the dispatch is still pending the declared lane reads as running.
+    assert "환불액 계산" in header() and "실행 중" in header()
+    for _ in range(plugin._MAX_FORCED_DELEGATE_ATTEMPTS + 1):
+        _pending_delegate_request(session_id, turn_id)
+    released = header()
+    assert released.endswith("· 위임 미실행_")
+    assert "실행 중" not in released and "환불액 계산" not in released
+
+    # A dispatch after the release is reported as the lane again.
+    with plugin._POLICY_LOCK:
+        plugin._TURN_PLANS[key]["dispatched"] = True
+    assert "환불액 계산" in header() and "위임 미실행" not in header()
+
+
+def test_forced_delegate_counter_restarts_with_a_new_plan_and_stops_on_dispatch():
+    plugin._ENFORCED_PLATFORMS = {"slack"}
+    session_id, turn_id = "delegate-reset-session", "delegate-reset-turn"
+    key = plugin._turn_key(session_id, turn_id)
+    agent = SimpleNamespace(session_id=session_id, _current_turn_id=turn_id)
+    with plugin._POLICY_LOCK:
+        plugin._TURN_PLANS[key] = {"mode": "parallel", "lanes": [], "dispatched": False}
+    for _ in range(plugin._MAX_FORCED_DELEGATE_ATTEMPTS):
+        assert _pending_delegate_request(session_id, turn_id) is not None
+    assert _pending_delegate_request(session_id, turn_id) is None
+
+    # route_turn stores a fresh plan dict, which is forced again from zero.
+    with plugin._POLICY_LOCK:
+        plugin._TURN_PLANS[key] = {"mode": "single", "lanes": [], "dispatched": False}
+    assert plugin._delegate_forcing_exhausted(agent) is False
+    forced = _pending_delegate_request(session_id, turn_id)
+    assert forced["request"]["tool_choice"]["function"]["name"] == "delegate_task"
+
+    # A dispatched plan is neither forced nor counted as exhausted.
+    with plugin._POLICY_LOCK:
+        plan = plugin._TURN_PLANS[key]
+        plan["forced_delegate_attempts"] = plugin._MAX_FORCED_DELEGATE_ATTEMPTS
+        plan["dispatched"] = True
+    assert _pending_delegate_request(session_id, turn_id) is None
+    assert plugin._delegate_forcing_exhausted(agent) is False
+    with plugin._POLICY_LOCK:
+        assert "delegate_forcing_released" not in plugin._TURN_PLANS[key]
 
 
 def test_accepted_plan_clears_forced_route_counter():
@@ -1413,7 +1452,7 @@ def test_delegated_acceptance_carries_interim_status_note(registered_plugin):
                 "lanes": [
                     {
                         "label": "자료수집",
-                        "phase": "worker", "work_type": "mechanical",
+                        "work_type": "mechanical",
                         "model": "gpt-5.6-luna-900k",
                         "reasoning_effort": "low",
                         "toolsets": ["web"],
@@ -1443,27 +1482,23 @@ def test_delegated_acceptance_carries_interim_status_note(registered_plugin):
 def test_schema_prefers_direct_over_trivial_delegation_and_limits_astra():
     desc = plugin.ROUTE_TURN_SCHEMA["description"]
     assert "never delegate a question you can answer immediately" in desc
-    assert "uncertain about RISK" in desc
+    assert "When uncertain whether delegation is worth it, choose direct" in desc
     assert "exceptional architecture" in desc
     assert "mechanical delegated work" not in desc or "work_type" in desc
     assert "Verification MUST use gpt-6.1-sol" in desc
     assert "any allowlisted model" in desc
 
 
-def test_delegation_phase_contract_exposes_only_verifier_state():
-    worker_key = plugin._turn_key("session", "worker-turn")
-    verifier_key = plugin._turn_key("session", "verifier-turn")
+def test_delegation_phase_contract_is_always_worker():
+    key = plugin._turn_key("session", "legacy-verification-turn")
     with plugin._POLICY_LOCK:
-        plugin._TURN_PLANS[worker_key] = {"mode": "worker_verifier", "lanes": [{"phase": "worker", "work_type": "mechanical"}]}
-        plugin._TURN_PLANS[verifier_key] = {"mode": "verification", "lanes": [{"phase": "verifier"}]}
+        plugin._TURN_PLANS[key] = {"mode": "verification", "lanes": []}
     try:
-        assert plugin.delegation_phase_for_turn("session", "worker-turn") == "worker"
-        assert plugin.delegation_phase_for_turn("session", "verifier-turn") == "verifier"
+        assert plugin.delegation_phase_for_turn("session", "legacy-verification-turn") == "worker"
         assert plugin.delegation_phase_for_turn("missing", "turn") == "worker"
     finally:
         with plugin._POLICY_LOCK:
-            plugin._TURN_PLANS.pop(worker_key, None)
-            plugin._TURN_PLANS.pop(verifier_key, None)
+            plugin._TURN_PLANS.pop(key, None)
 
 
 def _completion_db(tmp_path, state="completed", owner="parent", delivery="parent", compressed=False):
@@ -1523,12 +1558,25 @@ def test_policy_error_uses_precise_unverified_label():
     assert "실행정보 확인 실패" not in out
 
 
-def test_routine_work_guidance_preserves_worker_verifier_boundary():
+def test_route_turn_schema_has_no_automatic_verification():
     description = plugin.ROUTE_TURN_SCHEMA["description"]
-    assert "Ordinary local analysis, research" in description
-    assert "reversible file edits use direct, single, or parallel" in description
-    assert "external writes (send/post/publish/submit)" in description
-    assert "Do not select worker_verifier for routine work" in description
+    assert "No verification stage runs automatically" in description
+    assert "tests in the same worker lane" in description
+    assert "not implementation plus its tests" in description
+    assert "only when the user explicitly asks" in description
+    # A dependent review is never planned alongside the work it reviews.
+    assert "never put a review in the same parallel plan as that work" in description
+    assert "delegate the work only" in description
+    assert "requested in a follow-up message" in description
+    for removed in ("worker_verifier", "development_review", "review_task_id", "phase=verifier"):
+        assert removed not in description
+    properties = plugin.ROUTE_TURN_SCHEMA["parameters"]["properties"]
+    assert properties["mode"]["enum"] == ["direct", "single", "parallel"]
+    assert "review_task_id" not in properties
+    lane_items = properties["lanes"]["items"]
+    assert "phase" not in lane_items["properties"] and "phase" not in lane_items["required"]
+    assert not hasattr(plugin, "_review_action")
+    assert not hasattr(plugin, "_worker_verifier_requirement")
 
 
 def test_skill_refresh_uses_direct_before_reclassifying_work():
@@ -1546,3 +1594,85 @@ def test_localized_direct_route_allows_skill_read_and_final_verification(monkeyp
     for tool in ("skill_view", "mcp__figma__use_figma", "mcp__figma__get_screenshot"):
         assert plugin._pre_tool_policy(tool, **context) is None
     assert plugin._llm_request_policy({"messages": []}, api_mode="chat_completions", **context) is None
+
+
+@pytest.fixture
+def captured_core_entrypoint(monkeypatch):
+    """Install over a captured native original, never replace the patched entrypoint."""
+    import copy
+    import functools
+    import tools.delegate_tool as native
+
+    captured = {}
+    original = native.delegate_task
+
+    @functools.wraps(original)
+    def core_original(*args, **kwargs):
+        tasks = kwargs.get("tasks", args[2] if len(args) >= 3 else None)
+        if isinstance(tasks, str):
+            tasks = json.loads(tasks)
+        captured.update(tasks=copy.deepcopy(tasks))
+        return json.dumps({"delegation_id": "deleg-1"})
+
+    monkeypatch.setattr(native, "delegate_task", core_original)
+    ctx = FakeCtx()
+    plugin.register(ctx)
+    try:
+        yield ctx, captured
+    finally:
+        ctx.unload()
+
+
+@pytest.mark.parametrize("entry", ["core", "registry", "positional", "json"])
+def test_route_dispatch_and_async_completion_contract(captured_core_entrypoint, tmp_path, monkeypatch, entry):
+    import tools.delegate_tool as native
+    import hermes_constants
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+    ctx, captured = captured_core_entrypoint
+    sid, turn, done = f"owner-{entry}", f"dispatch-{entry}", f"complete-{entry}"
+    plugin._SKIP_HEADER_SESSIONS.discard(sid)
+    p = parent()
+    p.session_id, p._current_turn_id, p.platform, p._delegate_depth = sid, turn, "slack", 0
+    lane = {"label": "구현", "work_type": "implementation", "model": "claude-opus-5",
+            "reasoning_effort": "high", "toolsets": ["file"]}
+    route = json.loads(ctx.tools["route_turn"]({"mode": "single", "reason": "bounded work",
+                                               "lanes": [lane]}, parent_agent=p))
+    assert route["status"] == "accepted" and route["dispatch_lanes"] == [lane]
+    assert "deferred_verifier_lanes" not in route
+    tasks = [{"goal": "do the work", "label": "구현", "model": lane["model"],
+              "reasoning_effort": lane["reasoning_effort"], "toolsets": lane["toolsets"],
+              "acp_command": "must be stripped"}]
+    stripped = native._strip_model_hidden_task_fields(tasks)
+    assert native.delegate_task.__name__ == "routed_delegate_task"
+    if entry == "registry":
+        raw = ctx.tools["delegate_task"]({"tasks": tasks}, parent_agent=p)
+    elif entry == "positional":
+        raw = native.delegate_task(None, None, stripped, parent_agent=p)
+    else:
+        raw = native.delegate_task(tasks=json.dumps(stripped) if entry == "json" else stripped,
+                                   parent_agent=p)
+    assert json.loads(raw)["delegation_id"] == "deleg-1"
+    # The worker goal reaches core unchanged: no reviewer goal or schema is injected.
+    assert captured["tasks"][0]["goal"] == "do the work"
+    assert "output_schema" not in captured["tasks"][0]
+    assert "acp_command" not in captured["tasks"][0]
+    plan = plugin._TURN_PLANS[plugin._turn_key(sid, turn)]
+    assert plan["dispatched"] is True and plan["delegation_id"] == "deleg-1"
+    context = dict(session_id=sid, platform="slack", task_id="parent")
+    assert plugin._llm_request_policy({"input": []}, turn_id=turn,
+                                      api_mode="codex_responses", **context) is None
+    event = {"results": [{"status": "completed", "routing": {
+        "label": "구현", "requested_model": "claude-opus-5", "requested_reasoning_effort": "high",
+        "actual_model": "claude-opus-5", "actual_reasoning_effort": "high"}}]}
+    with sqlite3.connect(tmp_path / "state.db") as con:
+        con.execute("CREATE TABLE async_delegations (delegation_id TEXT, state TEXT, parent_session_id TEXT, event_json TEXT)")
+        con.execute("INSERT INTO async_delegations VALUES (?,?,?,?)",
+                    ("deleg-1", "completed", sid, json.dumps(event)))
+    plugin._pre_llm_policy(user_message="[ASYNC DELEGATION COMPLETE — deleg-1]", turn_id=done, **context)
+    final = plugin._TURN_PLANS[plugin._turn_key(sid, done)]
+    assert final["mode"] == "completion" and final["owned_delegation_ids"] == ["deleg-1"]
+    assert plugin._llm_request_policy({"input": []}, turn_id=done,
+                                      api_mode="codex_responses", **context) is None
+    out = plugin._transform_header("final complete", sid, "gpt-6.1-sol", turn_id=done)
+    assert "구현: claude-opus-5-high" in out.split("\n\n", 1)[0]
+    assert out.endswith("\n\nfinal complete") and "검토" not in out

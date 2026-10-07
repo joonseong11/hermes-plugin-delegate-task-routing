@@ -21,7 +21,7 @@ done
 payload=(
   __init__.py plugin.yaml README.md CHANGELOG.md COMPATIBILITY.md LICENSE
   tests/test_routing.py
-  tests/test_development_review.py tests/test_five_model_policy.py tests/test_risk_policy.py
+  tests/test_five_model_policy.py tests/test_recovery_runtime.py
   docs/SLACK_SMOKE_TEST.md
   scripts/verify.sh scripts/deploy.sh scripts/rollback.sh scripts/pre-update-check.sh
   scripts/check-version.sh
