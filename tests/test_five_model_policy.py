@@ -190,7 +190,8 @@ def test_registered_route_uses_configuration_in_validator_and_guidance(monkeypat
             payload = {"mode": "single", "reason": "policy test", "lanes": [lane(work_type, model)]}
             result = json.loads(ctx.tools["route_turn"](payload, session_id=sid, turn_id=tid))
             assert result["status"] == "accepted"
-            payload["lanes"][0]["model"] = "gpt-6-luna"
+            # Neither a fixed nor an additional model under either parametrization.
+            payload["lanes"][0]["model"] = "claude-fable-5.1"
             rejected = json.loads(ctx.tools["route_turn"](payload, session_id=sid, turn_id="rejected-turn"))
             assert f"use {model}" in rejected["error"]
             assert plugin._turn_key(sid, "rejected-turn") not in plugin._TURN_PLANS
@@ -199,7 +200,7 @@ def test_registered_route_uses_configuration_in_validator_and_guidance(monkeypat
             task = {k: v for k, v in lane(work_type, model).items() if k != "work_type"}
             task["goal"] = "test"
             assert plugin._validate_delegate_against_plan(p, [task])["lanes"][0]["work_type"] == work_type
-            task["model"] = "gpt-6-luna"
+            task["model"] = "claude-fable-5.1"
             with pytest.raises(ValueError, match="model does not match"):
                 plugin._validate_delegate_against_plan(p, [task])
             plugin._TURN_PLANS.pop(key, None)

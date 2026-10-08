@@ -11,7 +11,7 @@ All notable changes to this project are documented here.
 
 ### Verification
 
-- Added regressions for the default, partial and empty overrides, malformed configuration, the allowlist requirement, the registered schema/guidance text and an Astra lane through `route_turn` and plan matching. The registered-route test now uses `gpt-6-luna` as its rejected model.
+- Added regressions for the default, partial and empty overrides, malformed configuration, the allowlist requirement, the registered schema/guidance text and an Astra lane through `route_turn` and plan matching. The registered-route test now uses `claude-fable-5.1` as its rejected model.
 - Compilation and direct calls to the policy functions passed locally. `scripts/verify.sh` against the installed Hermes has not been run for this version; the gateway restart and the Slack smoke test are pending.
 
 ## [0.5.0] - 2026-10-07
