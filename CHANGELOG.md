@@ -12,7 +12,7 @@ All notable changes to this project are documented here.
 ### Verification
 
 - Added regressions for the default, partial and empty overrides, malformed configuration, the allowlist requirement, the registered schema/guidance text and an Astra lane through `route_turn` and plan matching. The registered-route test now uses `claude-fable-5.1` as its rejected model.
-- Compilation and direct calls to the policy functions passed locally. `scripts/verify.sh` against the installed Hermes has not been run for this version; the gateway restart and the Slack smoke test are pending.
+- `scripts/verify.sh` passed in the gateway container against the installed Hermes from a separate checkout of this branch at `7de6bee`: 202 tests and the installed private-symbol contract. The gateway restart and the Slack smoke test are pending.
 
 ## [0.5.0] - 2026-10-07
 
