@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented here.
 
+## [0.6.0] - 2026-10-08
+
+### Added
+
+- `implementation` lanes accept `gpt-6-astra` in addition to the fixed `claude-opus-5`. Before this, a user who asked for the Figma build on Astra got a rejected route, because `implementation` accepted only its fixed model. Opus 5 stays the default: the `route_turn` guidance tells the parent to choose Astra only when the user names it. The plugin checks model membership only and does not read the user's message. `research` and `verification` are unchanged.
+- `settings.additional_models` lists the extra models per fixed work type. Partial overrides merge with the default, an empty list removes them, entries must be in `allowed_models`, and malformed values fail closed. A built-in default outside a narrowed `allowed_models` is dropped instead of failing the load.
+
+### Verification
+
+- Added regressions for the default, partial and empty overrides, malformed configuration, the allowlist requirement, the registered schema/guidance text and an Astra lane through `route_turn` and plan matching. The registered-route test now uses `gpt-6-luna` as its rejected model.
+- Compilation and direct calls to the policy functions passed locally. `scripts/verify.sh` against the installed Hermes has not been run for this version; the gateway restart and the Slack smoke test are pending.
+
 ## [0.5.0] - 2026-10-07
 
 ### Removed

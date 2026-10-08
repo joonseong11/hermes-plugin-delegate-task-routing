@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 
-PLUGIN_VERSION = "0.5.0"
+PLUGIN_VERSION = "0.6.0"
 PLUGIN_ID = "delegate-task-routing"
 _PATCH_MARKER = "_delegate_task_routing_plugin_v1"
 _ROUTE_FIELDS = ("label", "model", "reasoning_effort", "toolsets")
@@ -43,6 +43,11 @@ DEFAULT_FIXED_MODELS = {
     "implementation": "claude-opus-5",
     "research": "claude-opus-5",
     "verification": "gpt-6.1-sol",
+}
+# Models a fixed work type also accepts besides its fixed model. The fixed model
+# stays the default; an additional model is for a user who names it.
+DEFAULT_ADDITIONAL_MODELS = {
+    "implementation": ("gpt-6-astra",),
 }
 WORK_TYPES = ("implementation", "research", "verification", "mechanical", "architecture")
 # Recovery authorization is independent of primary lane selection.
@@ -213,7 +218,9 @@ ROUTE_TURN_SCHEMA = {
         "Per-lane work_type is required: implementation (code changes, file/sheet/doc "
         "writing, Figma edits, deploy preparation, any local/external write) and "
         "research (web research, DB query analysis, root-cause diagnosis, comparison "
-        "or recommendation) MUST use claude-opus-5. Verification MUST use "
+        "or recommendation) MUST use claude-opus-5. Implementation may use "
+        "gpt-6-astra instead only when the user names that model for the work. "
+        "Verification MUST use "
         "gpt-6.1-sol with work_type=verification. Mechanical work (extraction, "
         "reformatting, deterministic checks, simple visual QA) and exceptional "
         "architecture may choose any allowlisted model, e.g. gpt-6-luna, gpt-6-astra, "
@@ -246,7 +253,7 @@ ROUTE_TURN_SCHEMA = {
                         "label": {"type": "string", "minLength": 1},
                         "work_type": {
                             "type": "string", "enum": list(WORK_TYPES),
-                            "description": "Required semantic work category. implementation/research: claude-opus-5; verification: gpt-6.1-sol; mechanical/architecture: any allowlisted model.",
+                            "description": "Required semantic work category. implementation: claude-opus-5 (gpt-6-astra only when the user names it); research: claude-opus-5; verification: gpt-6.1-sol; mechanical/architecture: any allowlisted model.",
                         },
                         "model": {"type": "string"},
                         "reasoning_effort": {"type": "string"},
@@ -853,6 +860,40 @@ def _fixed_model_policy(value: Any = None) -> dict[str, str]:
     return {**DEFAULT_FIXED_MODELS, **value}
 
 
+def _additional_model_policy(value: Any = None) -> dict[str, tuple[str, ...]]:
+    """Merge partial operator overrides; an empty list removes the defaults."""
+    if value is None:
+        return dict(DEFAULT_ADDITIONAL_MODELS)
+    if not isinstance(value, Mapping):
+        raise ValueError("additional_models must be an object")
+    if set(value) - set(DEFAULT_FIXED_MODELS):
+        raise ValueError("additional_models accepts only implementation, research, verification")
+    merged = dict(DEFAULT_ADDITIONAL_MODELS)
+    for work_type, models in value.items():
+        if not isinstance(models, (list, tuple)):
+            raise ValueError(f"additional_models.{work_type} must be a list of model IDs")
+        for model in models:
+            if not isinstance(model, str) or not model or model != model.strip():
+                raise ValueError(
+                    f"additional_models.{work_type} must contain exact non-empty model IDs"
+                )
+        merged[work_type] = tuple(models)
+    return merged
+
+
+def _work_type_guidance(
+    fixed: Mapping[str, str], additional: Mapping[str, Sequence[str]]
+) -> str:
+    parts = []
+    for work_type in ("implementation", "research", "verification"):
+        extra = [m for m in additional.get(work_type, ()) if m != fixed[work_type]]
+        text = f"{work_type}: {fixed[work_type]}"
+        if extra:
+            text += f" ({', '.join(extra)} only when the user names it)"
+        parts.append(text)
+    return "; ".join(parts) + "; mechanical/architecture: any allowlisted model."
+
+
 def _validate_plan(
     payload: Mapping[str, Any],
     *,
@@ -860,8 +901,10 @@ def _validate_plan(
     allowed_efforts: Sequence[str],
     allowed_toolsets: Sequence[str],
     fixed_models: Mapping[str, str] | None = None,
+    additional_models: Mapping[str, Sequence[str]] | None = None,
 ) -> dict[str, Any]:
     fixed = _fixed_model_policy(fixed_models)
+    additional = _additional_model_policy(additional_models)
     mode = str(payload.get("mode") or "").strip().lower()
     reason = str(payload.get("reason") or "").strip()
     lanes = payload.get("lanes")
@@ -898,7 +941,11 @@ def _validate_plan(
         if not isinstance(work_type, str) or work_type not in WORK_TYPES:
             raise ValueError(f"lane {index} work_type must be one of {', '.join(WORK_TYPES)}")
         required_model = fixed.get(work_type)
-        if required_model and model != required_model:
+        if (
+            required_model
+            and model != required_model
+            and model not in additional.get(work_type, ())
+        ):
             raise ValueError(
                 f"lane {index} work_type={work_type} requires model={required_model}; "
                 f"use {required_model} instead of {model}"
@@ -1721,14 +1768,22 @@ def register(ctx) -> None:
         for work_type, model in fixed_models.items():
             if model not in allowed_models:
                 raise ValueError(f"fixed_models.{work_type}={model} must be in allowed_models")
+        configured_additional = ctx.get_config("additional_models", None)
+        additional_models = _additional_model_policy(configured_additional)
+        for work_type, models in additional_models.items():
+            if configured_additional is not None and work_type in configured_additional:
+                for model in models:
+                    if model not in allowed_models:
+                        raise ValueError(
+                            f"additional_models.{work_type}={model} must be in allowed_models"
+                        )
+            # A built-in default outside a narrowed allowlist is dropped, not fatal.
+            additional_models[work_type] = tuple(m for m in models if m in allowed_models)
         route_schema = copy.deepcopy(ROUTE_TURN_SCHEMA)
         lane_schema = route_schema["parameters"]["properties"]["lanes"]["items"]
         lane_schema["properties"]["model"]["enum"] = list(allowed_models)
-        lane_schema["properties"]["work_type"]["description"] = (
-            f"implementation: {fixed_models['implementation']}; "
-            f"research: {fixed_models['research']}; "
-            f"verification: {fixed_models['verification']}; "
-            "mechanical/architecture: any allowlisted model."
+        lane_schema["properties"]["work_type"]["description"] = _work_type_guidance(
+            fixed_models, additional_models
         )
         # Replace only policy IDs, not recovery-chain IDs, in the selection text.
         start = route_schema["description"].index("Per-lane work_type")
@@ -1774,6 +1829,7 @@ def register(ctx) -> None:
                     allowed_efforts=allowed_efforts,
                     allowed_toolsets=allowed_toolsets,
                     fixed_models=fixed_models,
+                    additional_models=additional_models,
                 )
                 parent_sets = set(getattr(parent_agent, "enabled_toolsets", None) or [])
                 for index, lane in enumerate(plan["lanes"]):

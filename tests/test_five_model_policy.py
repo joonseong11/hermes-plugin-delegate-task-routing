@@ -93,8 +93,9 @@ def test_roster_schema_and_policy():
 @pytest.mark.parametrize("work_type", ["implementation", "research"])
 @pytest.mark.parametrize("model", MODELS)
 def test_execution_and_research_fixed_model(work_type, model):
-    if model == "claude-opus-5":
-        assert validate([lane(work_type, model)])["lanes"][0]["work_type"] == work_type
+    additional = plugin.DEFAULT_ADDITIONAL_MODELS.get(work_type, ())
+    if model == "claude-opus-5" or model in additional:
+        assert validate([lane(work_type, model)])["lanes"][0]["model"] == model
     else:
         with pytest.raises(ValueError, match=f"work_type={work_type} requires model=claude-opus-5; use claude-opus-5"):
             validate([lane(work_type, model)])
@@ -189,7 +190,7 @@ def test_registered_route_uses_configuration_in_validator_and_guidance(monkeypat
             payload = {"mode": "single", "reason": "policy test", "lanes": [lane(work_type, model)]}
             result = json.loads(ctx.tools["route_turn"](payload, session_id=sid, turn_id=tid))
             assert result["status"] == "accepted"
-            payload["lanes"][0]["model"] = "gpt-6-astra"
+            payload["lanes"][0]["model"] = "gpt-6-luna"
             rejected = json.loads(ctx.tools["route_turn"](payload, session_id=sid, turn_id="rejected-turn"))
             assert f"use {model}" in rejected["error"]
             assert plugin._turn_key(sid, "rejected-turn") not in plugin._TURN_PLANS
@@ -198,12 +199,114 @@ def test_registered_route_uses_configuration_in_validator_and_guidance(monkeypat
             task = {k: v for k, v in lane(work_type, model).items() if k != "work_type"}
             task["goal"] = "test"
             assert plugin._validate_delegate_against_plan(p, [task])["lanes"][0]["work_type"] == work_type
-            task["model"] = "gpt-6-astra"
+            task["model"] = "gpt-6-luna"
             with pytest.raises(ValueError, match="model does not match"):
                 plugin._validate_delegate_against_plan(p, [task])
             plugin._TURN_PLANS.pop(key, None)
     finally:
         ctx.unload()
+
+
+def test_default_additional_model_is_implementation_only():
+    assert plugin.DEFAULT_ADDITIONAL_MODELS == {"implementation": ("gpt-6-astra",)}
+    assert validate([lane("implementation", "gpt-6-astra")])["lanes"][0]["model"] == "gpt-6-astra"
+    assert validate([lane("implementation", "claude-opus-5")])["lanes"][0]["model"] == "claude-opus-5"
+    for work_type in ("research", "verification"):
+        with pytest.raises(ValueError, match=f"work_type={work_type} requires model="):
+            validate([lane(work_type, "gpt-6-astra")])
+
+
+def test_additional_model_override_merges_and_empty_list_disables():
+    with pytest.raises(ValueError, match="requires model=claude-opus-5"):
+        validate([lane("implementation", "gpt-6-astra")], additional_models={"implementation": []})
+    extra = {"research": ["claude-fable-5.1"]}
+    assert validate([lane("research", "claude-fable-5.1")], additional_models=extra)["lanes"][0]["model"] == "claude-fable-5.1"
+    # A partial override keeps the built-in implementation entry.
+    assert validate([lane("implementation", "gpt-6-astra")], additional_models=extra)["lanes"][0]["model"] == "gpt-6-astra"
+    with pytest.raises(ValueError, match="requires model=claude-opus-5"):
+        validate([lane("research", "gpt-6-luna")], additional_models=extra)
+
+
+def test_additional_model_still_needs_the_allowlist():
+    payload = {"mode": "single", "reason": "bounded work", "lanes": [lane("implementation", "gpt-6-astra")]}
+    with pytest.raises(ValueError, match="model is not allowed"):
+        plugin._validate_plan(
+            payload, allowed_models=["claude-opus-5"],
+            allowed_efforts=settings("allowed_reasoning_efforts"),
+            allowed_toolsets=settings("allowed_toolsets"),
+        )
+
+
+@pytest.mark.parametrize("value", [[], "astra", {"mechanical": ["gpt-6-luna"]},
+                                   {"implementation": "gpt-6-astra"}, {"implementation": [""]},
+                                   {"research": [None]}, {"verification": [" gpt-6-luna"]}])
+def test_malformed_additional_model_config_fails_closed(value):
+    with pytest.raises(ValueError, match="additional_models"):
+        plugin._additional_model_policy(value)
+
+
+def _register_with(config):
+    ctx = FakeCtx()
+    ctx.get_config = lambda key, default=None: config[key] if key in config else six_settings(key, default)
+    registrations = {}
+    original = ctx.register_tool
+
+    def capture(**kwargs):
+        registrations[kwargs["name"]] = kwargs
+        return original(**kwargs)
+
+    ctx.register_tool = capture
+    plugin.register(ctx)
+    return ctx, registrations["route_turn"]["schema"]
+
+
+def test_registered_route_accepts_and_describes_additional_model(monkeypatch):
+    ctx, route = _register_with({})
+    try:
+        guidance = "implementation: claude-opus-5 (gpt-6-astra only when the user names it)"
+        assert guidance in route["description"]
+        assert guidance in route["parameters"]["properties"]["lanes"]["items"]["properties"]["work_type"]["description"]
+        assert "research: claude-opus-5;" in route["description"]
+        sid, tid = "additional-implementation", "additional-turn"
+        monkeypatch.delitem(plugin._TURN_PLANS, plugin._turn_key(sid, tid), raising=False)
+        payload = {"mode": "single", "reason": "user named the model",
+                   "lanes": [lane("implementation", "gpt-6-astra")]}
+        result = json.loads(ctx.tools["route_turn"](payload, session_id=sid, turn_id=tid))
+        assert result["status"] == "accepted"
+        p = parent()
+        p.session_id, p._current_turn_id = sid, tid
+        task = {k: v for k, v in lane("implementation", "gpt-6-astra").items() if k != "work_type"}
+        task["goal"] = "test"
+        assert plugin._validate_delegate_against_plan(p, [task])["lanes"][0]["model"] == "gpt-6-astra"
+        payload["lanes"][0]["work_type"] = "research"
+        rejected = json.loads(ctx.tools["route_turn"](payload, session_id=sid, turn_id="rejected-turn"))
+        assert "use claude-opus-5" in rejected["error"]
+        plugin._TURN_PLANS.pop(plugin._turn_key(sid, tid), None)
+    finally:
+        ctx.unload()
+
+
+def test_registered_route_drops_default_additional_model_outside_allowlist():
+    narrowed = [m for m in MODELS if m != "gpt-6-astra"]
+    ctx, route = _register_with({"allowed_models": narrowed})
+    try:
+        assert "gpt-6-astra only when" not in route["description"]
+        payload = {"mode": "single", "reason": "policy test",
+                   "lanes": [lane("implementation", "gpt-6-astra")]}
+        rejected = json.loads(ctx.tools["route_turn"](payload, session_id="narrowed", turn_id="narrowed-turn"))
+        assert "use claude-opus-5" in rejected["error"]
+    finally:
+        ctx.unload()
+
+
+def test_unapproved_additional_override_registration_fails_and_unloads():
+    import tools.delegate_tool as native
+    original = native.delegate_task
+    ctx = FakeCtx()
+    ctx.get_config = lambda key, default=None: ({"implementation": ["unapproved"]} if key == "additional_models" else six_settings(key, default))
+    with pytest.raises(ValueError, match="additional_models.implementation=unapproved must be in allowed_models"):
+        plugin.register(ctx)
+    assert native.delegate_task is original
 
 
 def test_unapproved_fixed_override_registration_fails_and_unloads():
