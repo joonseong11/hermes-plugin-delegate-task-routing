@@ -1,6 +1,6 @@
 # delegate-task-routing
 
-Current release: `v0.5.0` (gateway activation pending). See [COMPATIBILITY.md](COMPATIBILITY.md) before changing the Hermes version and [CHANGELOG.md](CHANGELOG.md) for release history.
+Current release: `v0.6.0` (gateway activation pending). See [COMPATIBILITY.md](COMPATIBILITY.md) before changing the Hermes version and [CHANGELOG.md](CHANGELOG.md) for release history.
 
 Persistent, in-process orchestration policy for Hermes. It forces a per-turn execution decision on Slack parent sessions, applies exact-allowlisted per-task routing, records requested versus actual child execution, and deterministically prepends the `_Alex: ..._` execution header.
 
@@ -108,7 +108,7 @@ Every `route_turn` lane requires `work_type` with an exact enum value:
 
 | Work type | Required primary model | Scope |
 | --- | --- | --- |
-| `implementation` | `claude-opus-5` | Code changes, file/sheet/doc writing, Figma edits, deploy preparation, any local/external write |
+| `implementation` | `claude-opus-5`; also accepts `gpt-6-astra` | Code changes, file/sheet/doc writing, Figma edits, deploy preparation, any local/external write |
 | `research` | `claude-opus-5` | Web research, DB query analysis, root-cause diagnosis, comparison/recommendation |
 | `verification` | `gpt-6.1-sol` | Independent checks and reviews a user asks for |
 | `mechanical` | Any allowlisted model | Extraction, reformatting, deterministic checks, simple visual QA |
@@ -128,6 +128,27 @@ fixed_models:
   research: claude-opus-5
   verification: gpt-6.1-sol
 ```
+
+A fixed work type can also accept additional models. The fixed model stays the
+default; the guidance tells the parent to pick an additional model only when the
+user names it for the work. The plugin checks membership, not who asked: it does
+not read the user's message, so this limit is model-facing guidance. By default
+`implementation` also accepts `gpt-6-astra` (v0.6.0); `research` and
+`verification` accept nothing extra.
+
+Partial `settings.additional_models` overrides merge with that default. Each
+value is a list of exact IDs present in `allowed_models`; an empty list removes
+the additional models for that work type. Unknown keys/invalid values fail
+closed. A built-in default that is outside a narrowed `allowed_models` is dropped
+rather than failing the load:
+
+```yaml
+additional_models:
+  implementation: [gpt-6-astra]
+```
+
+`gpt-6-astra` is outside the recovery chain below, so an Astra lane that fails
+is not retried on another model.
 
 This changes delegated lane models, not the parent model. Trivial safe work stays
 direct; bounded work uses single; independent outcomes use parallel.
